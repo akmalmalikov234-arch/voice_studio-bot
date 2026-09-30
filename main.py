@@ -27,6 +27,7 @@ TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # asosiy admin ID
 CARD_NUMBER = os.getenv("CARD_NUMBER", "")
 CARD_OWNER = os.getenv("CARD_OWNER", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "").lstrip("@")
 # ==============================================================
 
 TOKEN = os.getenv("BOT_TOKEN", "")
@@ -97,11 +98,67 @@ if not db.execute("SELECT 1 FROM langs").fetchone():
             db.execute("INSERT INTO voices(code,name,edge) VALUES(?,?,?)", (_code, _vn, _ev))
 db.commit()
 
+# ============ AI GENERATION / JOB QUEUE (Render + local GPU worker) ============
+db.executescript("""
+CREATE TABLE IF NOT EXISTS ai_models(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, kind TEXT DEFAULT 'image',
+  price INTEGER DEFAULT 1000, enabled INTEGER DEFAULT 0, description TEXT DEFAULT '',
+  workflow TEXT DEFAULT '', created INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS ai_jobs(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER NOT NULL, model_id INTEGER NOT NULL,
+  prompt TEXT NOT NULL, negative TEXT DEFAULT '', params TEXT DEFAULT '{}', status TEXT DEFAULT 'queued',
+  cost INTEGER DEFAULT 0, worker_id TEXT DEFAULT '', result_path TEXT DEFAULT '', result_type TEXT DEFAULT '',
+  error TEXT DEFAULT '', created INTEGER DEFAULT 0, updated INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_ai_jobs_status ON ai_jobs(status, id);
+""")
+
+MODEL_CATALOG = [
+ ('SDXL / Stable Diffusion','image',1000,'Mahalliy rasm generatsiyasi'),
+ ('FLUX.1','image',1500,'FLUX oilasi'),
+ ('FLUX.1 Kontext','image',1700,'Rasmni tahrirlash / kontekst'),
+ ('Qwen-Image','image',1600,'Qwen Image'),
+ ('Hunyuan Image','image',1800,'Tencent Hunyuan Image'),
+ ('Stable Diffusion 3.5','image',1500,'SD3.5'),
+ ('SDXL Turbo','image',800,'Tezkor rasm'),
+ ('SD 1.5','image',600,'Yengil model'),
+ ('Kandinsky','image',900,'Kandinsky'),
+ ('Playground','image',1000,'Playground oilasi'),
+ ('PixArt','image',1000,'PixArt'),
+ ('AuraFlow','image',1200,'AuraFlow'),
+ ('Kolors','image',1500,'Kolors'),
+ ('Wan 2.1 T2V','video',5000,'Text-to-video'),
+ ('Wan 2.1 I2V','video',6000,'Image-to-video'),
+ ('Wan 2.2','video',7000,'Wan 2.2'),
+ ('LTX-Video','video',4500,'LTX Video'),
+ ('CogVideoX','video',5500,'CogVideoX'),
+ ('HunyuanVideo','video',8000,'HunyuanVideo'),
+ ('HunyuanVideo 1.5','video',7500,'HunyuanVideo 1.5'),
+ ('Mochi','video',6000,'Mochi video'),
+ ('AnimateDiff','video',3500,'AnimateDiff'),
+ ('Stable Video Diffusion','video',4500,'SVD'),
+ ('CogVideoX I2V','video',6000,'Image-to-video'),
+ ('LTXV Image-to-Video','video',5000,'LTXV I2V'),
+ ('Hunyuan I2V','video',7500,'Hunyuan image-to-video'),
+ ('Open-Sora','video',7000,'Open-Sora'),
+ ('VideoCrafter','video',6500,'VideoCrafter'),
+ ('ModelScope Video','video',5000,'ModelScope T2V'),
+]
+now_ts=int(time.time())
+for _name,_kind,_price,_desc in MODEL_CATALOG:
+    db.execute("INSERT OR IGNORE INTO ai_models(name,kind,price,enabled,description,created) VALUES(?,?,?,?,?,?)",
+               (_name,_kind,_price,0,_desc,now_ts))
+db.commit()
+
 CFG = {k: v for k, v in db.execute("SELECT k,v FROM cfg")}
 ADMINS = {r[0] for r in db.execute("SELECT id FROM admins")}
 DEF = {"tts_price": "0.3", "stt_sec": "5", "start_bonus": "2000", "ref_bonus": "500",
        "min_topup": "1000", "max_tts": "3000", "amounts": "10000,25000,50000,100000",
-       "bot_on": "1", "card_number": CARD_NUMBER, "card_owner": CARD_OWNER}
+       "bot_on": "1", "card_number": CARD_NUMBER, "card_owner": CARD_OWNER,
+       "worker_enabled": "0", "worker_name": "local-gpu-1", "worker_poll_seconds": "2",
+       "worker_note": "ComfyUI lokal GPU worker", "image_default_size": "1024x1024",
+       "gen_max_prompt": "2000", "worker_key": os.getenv("WORKER_KEY", "") }
 SETS = {
  "tts_price": ("TTS narxi (so'm/belgi)", "num"),
  "stt_sec": ("STT narxi (so'm/soniya)", "num"),
@@ -1094,142 +1151,51 @@ async def on_error(u, c):
 
 # ---------------- Render + Telegram Mini App ----------------
 WEB_APP_HTML = r"""<!doctype html>
-<html lang="uz">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>AI Voice Studio</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<html lang="uz"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Voice Studio AI</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
-:root{
-  --bg:var(--tg-theme-bg-color,#0b1020);
-  --card:var(--tg-theme-secondary-bg-color,#151c31);
-  --text:var(--tg-theme-text-color,#fff);
-  --muted:var(--tg-theme-hint-color,#9aa6bf);
-  --accent:var(--tg-theme-button-color,#4f7cff);
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,Arial,sans-serif}
-.wrap{max-width:620px;margin:auto;padding:18px 15px 34px}
-.hero{padding:20px;border-radius:24px;background:linear-gradient(135deg,#17213b,#10172a);box-shadow:0 12px 35px #0003}
-h1{margin:0 0 7px;font-size:27px}.sub{color:var(--muted);font-size:14px}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-top:14px}
-.card{background:var(--card);border:1px solid #ffffff12;border-radius:18px;padding:16px}
-button{width:100%;border:0;border-radius:15px;padding:14px 12px;background:var(--accent);color:#fff;font-weight:700;font-size:15px}
-button.secondary{background:#ffffff12;color:var(--text)}
-textarea{width:100%;min-height:150px;resize:vertical;background:var(--bg);color:var(--text);border:1px solid #ffffff18;border-radius:15px;padding:13px;font-size:15px;outline:none}
-.row{display:flex;gap:9px}.row>*{flex:1}.stat{font-size:24px;font-weight:800}.muted{color:var(--muted);font-size:13px}
-#status{margin-top:12px;color:var(--muted);min-height:20px}.hidden{display:none}
-audio{width:100%;margin-top:12px}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <section class="hero">
-    <h1>🎙 AI Voice Studio</h1>
-    <div class="sub" id="hello">Telegram Mini App</div>
-    <div class="grid">
-      <div class="card"><div class="muted">Balans</div><div class="stat" id="bal">...</div></div>
-      <div class="card"><div class="muted">Referallar</div><div class="stat" id="refs">...</div></div>
-    </div>
-  </section>
-
-  <section class="card" style="margin-top:13px">
-    <div style="font-weight:800;margin-bottom:10px">🔊 Matn → ovoz</div>
-    <textarea id="text" maxlength="2000" placeholder="Matn yozing..."></textarea>
-    <div class="row" style="margin-top:10px">
-      <button onclick="tts()">Ovoz yaratish</button>
-      <button class="secondary" onclick="clearText()">Tozalash</button>
-    </div>
-    <audio id="player" controls class="hidden"></audio>
-  </section>
-
-  <section class="card" style="margin-top:13px">
-    <div style="font-weight:800;margin-bottom:10px">🎙 Ovoz → matn</div>
-    <div class="row">
-      <button onclick="startRecord()" id="rec">🎙 Yozishni boshlash</button>
-      <button class="secondary" onclick="stopRecord()" id="stop" disabled>⏹ To‘xtatish</button>
-    </div>
-    <div id="sttResult" class="muted" style="margin-top:12px"></div>
-  </section>
-
-  <section class="grid">
-    <div class="card"><div class="muted">Foydalanuvchi ID</div><div id="uid">...</div></div>
-    <div class="card"><div class="muted">Til / Ovoz</div><div id="voice">...</div></div>
-  </section>
-  <div id="status"></div>
-</div>
+:root{--bg:#070b14;--card:#101827;--card2:#0d1420;--text:#f7f9fc;--muted:#8f9db2;--line:#1d2a3d;--a:#6c7cff;--b:#35d6c8;--danger:#ff6678}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#18244b 0,#070b14 42%),#070b14;color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0}.wrap{max-width:760px;margin:auto;padding:18px 14px 42px}.hero{padding:18px 4px 12px}.brand{font-weight:900;font-size:24px}.sub{color:var(--muted);font-size:13px;margin-top:5px}.balance{margin-top:16px;background:linear-gradient(135deg,#151f38,#0d1627);border:1px solid var(--line);border-radius:22px;padding:18px;display:flex;justify-content:space-between;align-items:center}.balnum{font-size:25px;font-weight:900}.pill{padding:7px 10px;border-radius:999px;background:#19243b;color:#b9c6ff;font-size:12px}.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}.tab{background:#101827;color:#aeb9ca;border:1px solid var(--line);border-radius:14px;padding:11px 6px}.tab.active{background:linear-gradient(135deg,#2a3568,#16263e);color:#fff;border-color:#5365b8}.panel{display:none}.panel.active{display:block}.card{background:rgba(16,24,39,.92);border:1px solid var(--line);border-radius:20px;padding:15px;margin:10px 0}.title{font-weight:800;margin-bottom:10px}.hint{font-size:12px;color:var(--muted);line-height:1.5}.textarea,.input,.select{width:100%;background:#09111d;border:1px solid #223047;color:#fff;border-radius:14px;padding:13px;outline:none}.textarea{min-height:130px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.btn{width:100%;padding:12px 14px;border-radius:13px;background:#202c43;color:#fff;font-weight:800}.btn.primary{background:linear-gradient(135deg,#6677ff,#3d53d8)}.btn.green{background:linear-gradient(135deg,#18bba9,#158c83)}.btn.red{background:#43202a;color:#ffb7c1}.btn:disabled{opacity:.45}.status{min-height:20px;color:#a9b7ca;font-size:13px;margin-top:10px}.audio{width:100%;margin-top:10px}.models{display:grid;gap:8px}.model{border:1px solid var(--line);border-radius:14px;padding:12px;background:#0b1320}.model strong{display:block}.model small{color:var(--muted)}.model.sel{border-color:#6677ff;background:#141d38}.job{padding:12px;border:1px solid var(--line);border-radius:14px;margin:7px 0}.jobtop{display:flex;justify-content:space-between}.ok{color:#50d5a7}.wait{color:#ffc866}.bad{color:#ff7586}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(7,11,20,.96);border-top:1px solid var(--line);padding:9px 10px;display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.nav button{background:transparent;color:#8290a6;padding:7px 3px;font-size:11px}.nav button.active{color:#fff}.adminbox{border:1px solid #354d7c;background:#0e1930}.hide{display:none!important}.kv{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #1b2738;font-size:13px}.kv:last-child{border:0}.danger{color:#ff7a8a}
+</style></head><body><div class="wrap">
+<div class="hero"><div class="brand">⚡ Voice Studio AI</div><div class="sub" id="hello">Yuklanmoqda...</div></div>
+<div class="balance"><div><div class="sub">Mening balansim</div><div class="balnum" id="bal">0 so‘m</div></div><div class="pill" id="refs">0 referal</div></div>
+<div id="home" class="panel active"><div class="tabs"><button class="tab active" onclick="mode('tts',this)">🔊 TTS</button><button class="tab" onclick="mode('stt',this)">🎙 STT</button><button class="tab" onclick="mode('gen',this)">🎨 AI</button></div>
+<div id="tts" class="card tool"><div class="title">🔊 Matn → tabiiy ovoz</div><textarea id="text" class="textarea" placeholder="Ovozga aylantiriladigan matn..."></textarea><div class="row" style="margin-top:9px"><button class="btn primary" onclick="tts()">Ovoz yaratish</button><button class="btn" onclick="clearText()">Tozalash</button></div><audio id="player" class="audio hide" controls></audio></div>
+<div id="stt" class="card tool hide"><div class="title">🎙 Ovoz → matn</div><div class="hint">Brauzer mikrofonidan yozib, matnga aylantiring.</div><div class="row" style="margin-top:10px"><button class="btn primary" id="rec" onclick="startRecord()">🔴 Yozish</button><button class="btn" id="stop" onclick="stopRecord()" disabled>⏹ To‘xtatish</button></div><div id="sttResult" class="card" style="margin-top:10px">Natija shu yerda chiqadi.</div></div>
+<div id="gen" class="card tool hide"><div class="title">🎨 AI rasm / 🎬 video</div><div id="modelList" class="models"></div><textarea id="prompt" class="textarea" style="margin-top:10px;min-height:100px" placeholder="Nima yaratilsin? Masalan: cinematic Uzbek city at sunset..."></textarea><input id="negative" class="input" style="margin-top:9px" placeholder="Negative prompt (ixtiyoriy)"><div class="row" style="margin-top:9px"><select id="size" class="select"><option>1024x1024</option><option>768x1024</option><option>1024x768</option><option>512x512</option></select><button class="btn primary" onclick="generate()">🚀 Yaratish</button></div><div id="genStatus" class="status"></div></div>
+<div class="card"><div class="title">⚙️ Joriy sozlamalar</div><div class="kv"><span>Til</span><b id="lang">-</b></div><div class="kv"><span>Ovoz</span><b id="voice">-</b></div></div></div>
+<div id="balancePanel" class="panel"><div class="card"><div class="title">💳 Balansni to‘ldirish</div><div class="hint" id="payInfo">-</div><div id="amounts" class="row" style="margin-top:10px"></div><input id="customAmount" class="input" style="margin-top:9px" placeholder="Boshqa summa"><button class="btn primary" style="margin-top:9px" onclick="topup()">To‘ldirish so‘rovini yuborish</button><div class="status" id="payStatus"></div></div></div>
+<div id="refPanel" class="panel"><div class="card"><div class="title">👥 Referal</div><div class="hint">Har bir haqiqiy yangi taklif uchun bonus admin sozlamasidan boshqariladi.</div><input id="refLink" class="input" style="margin-top:10px" readonly><button class="btn primary" style="margin-top:9px" onclick="copyRef()">Havolani nusxalash</button></div></div>
+<div id="jobsPanel" class="panel"><div class="card"><div class="title">🧾 Generatsiyalar</div><div id="jobs">Yuklanmoqda...</div></div></div>
+<div id="adminPanel" class="panel"><div class="card adminbox"><div class="title">👑 Admin panel</div><div class="hint">Narxlar, AI modellar, worker, bot holati va foydalanuvchi balanslari shu yerdan boshqariladi.</div><div class="row" style="margin-top:10px"><button class="btn" onclick="adminLoad()">Yangilash</button><button class="btn red" onclick="adminToggle()">Bot holati</button></div></div><div class="card"><div class="title">📊 Statistika</div><div id="astats">-</div></div><div class="card"><div class="title">🤖 AI modellarni boshqarish</div><div id="amodels">-</div><hr style="border-color:#1d2a3d;border-width:1px 0 0;margin:12px 0"><input id="mid" type="hidden"><input id="mname" class="input" placeholder="Model nomi"><div class="row" style="margin-top:8px"><select id="mkind" class="select"><option value="image">🖼️ image</option><option value="video">🎬 video</option></select><input id="mprice" class="input" type="number" placeholder="Narx"></div><textarea id="mworkflow" class="textarea" style="margin-top:8px;min-height:90px" placeholder="ComfyUI API workflow JSON (video va maxsus modellar uchun)"></textarea><div class="row" style="margin-top:8px"><button class="btn primary" onclick="saveModel()">Modelni saqlash</button><button class="btn" onclick="clearModel()">Tozalash</button></div></div><div class="card"><div class="title">⚙️ Worker</div><input id="workerName" class="input" placeholder="Worker nomi"><input id="workerKey" class="input" style="margin-top:8px" placeholder="Worker key (faqat bir marta ko‘rsatish uchun)"><button class="btn primary" style="margin-top:8px" onclick="saveWorker()">Saqlash</button></div></div>
+<div id="status" class="status"></div></div>
+<div class="nav"><button class="active" onclick="page('home',this)">🏠 Bosh</button><button onclick="page('balancePanel',this)">💳 Balans</button><button onclick="page('refPanel',this)">👥 Referal</button><button onclick="page('jobsPanel',this)">🧾 Ishlar</button><button id="adminNav" class="hide" onclick="page('adminPanel',this)">👑 Admin</button></div>
 <script>
-const tg=window.Telegram?.WebApp;
-if(tg){tg.ready();tg.expand();}
-let mediaRecorder=null,chunks=[];
-const headers=()=>({'Content-Type':'application/json','X-Telegram-Init-Data':tg?.initData||''});
+const tg=window.Telegram?.WebApp; tg?.ready(); tg?.expand(); const H=()=>({'X-Telegram-Init-Data':tg?.initData||'','Content-Type':'application/json'}); let selectedModel=null;
+async function api(url,opt={}){opt.headers={...(opt.headers||{}),...(url.includes('/api/')?H():{})};const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Xatolik');return d}
+function page(id,b){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));b?.classList.add('active')}
+function mode(id,b){document.querySelectorAll('.tool').forEach(x=>x.classList.add('hide'));document.getElementById(id).classList.remove('hide');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active')}
+async function load(){try{const d=await api('/api/me');document.getElementById('hello').textContent='Salom, '+(d.first_name||'foydalanuvchi')+' 👋';document.getElementById('bal').textContent=d.balance.toLocaleString()+' so‘m';document.getElementById('refs').textContent=d.refs+' referal';document.getElementById('lang').textContent=d.language||'-';document.getElementById('voice').textContent=d.voice||'-';document.getElementById('refLink').value=d.ref_link||'';if(d.is_admin)document.getElementById('adminNav').classList.remove('hide');document.getElementById('payInfo').textContent=d.pay_info||'-';document.getElementById('amounts').innerHTML=(d.amounts||[]).map(a=>`<button class="btn" onclick="document.getElementById('customAmount').value=${a}">${a.toLocaleString()} so‘m</button>`).join('');await loadModels();await loadJobs()}catch(e){status(e.message)}}
 function status(x){document.getElementById('status').textContent=x||''}
-async function api(path,opt={}){
-  opt.headers={...(opt.headers||{}),...headers()};
-  const r=await fetch(path,opt);
-  const data=await r.json().catch(()=>({error:'Server javobi noto‘g‘ri'}));
-  if(!r.ok) throw new Error(data.error||'Xatolik');
-  return data;
-}
-async function load(){
-  try{
-    const d=await api('/api/me');
-    document.getElementById('hello').textContent='Salom, '+(d.first_name||'foydalanuvchi')+' 👋';
-    document.getElementById('bal').textContent=d.balance+' so‘m';
-    document.getElementById('refs').textContent=d.refs;
-    document.getElementById('uid').textContent=d.id;
-    document.getElementById('voice').textContent=d.language+' · '+d.voice;
-  }catch(e){status(e.message)}
-}
-async function tts(){
-  const text=document.getElementById('text').value.trim();
-  if(!text)return status('Avval matn yozing.');
-  status('⏳ Ovoz tayyorlanmoqda...');
-  try{
-    const r=await fetch('/api/tts',{method:'POST',headers:headers(),body:JSON.stringify({text})});
-    if(!r.ok){const e=await r.json().catch(()=>({error:'Xatolik'}));throw new Error(e.error)}
-    const blob=await r.blob();
-    const url=URL.createObjectURL(blob);
-    const p=document.getElementById('player');p.src=url;p.classList.remove('hidden');p.play().catch(()=>{});
-    status('✅ Tayyor.');
-    load();
-  }catch(e){status('❌ '+e.message)}
-}
-function clearText(){document.getElementById('text').value='';status('')}
-async function startRecord(){
-  try{
-    const stream=await navigator.mediaDevices.getUserMedia({audio:true});
-    chunks=[];mediaRecorder=new MediaRecorder(stream);
-    mediaRecorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
-    mediaRecorder.onstop=async()=>{
-      stream.getTracks().forEach(t=>t.stop());
-      const blob=new Blob(chunks,{type:mediaRecorder.mimeType||'audio/webm'});
-      const fd=new FormData();fd.append('audio',blob,'voice.webm');
-      status('⏳ Ovoz matnga aylantirilmoqda...');
-      try{
-        const r=await fetch('/api/stt',{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:fd});
-        const d=await r.json();if(!r.ok)throw new Error(d.error||'STT xatosi');
-        document.getElementById('sttResult').textContent='📝 '+d.text;
-        status('✅ Tayyor.');
-        load();
-      }catch(e){status('❌ '+e.message)}
-    };
-    mediaRecorder.start();
-    document.getElementById('rec').disabled=true;
-    document.getElementById('stop').disabled=false;
-    status('🔴 Yozilmoqda...');
-  }catch(e){status('❌ Mikrofon ruxsati berilmadi.')}
-}
-function stopRecord(){
-  if(mediaRecorder&&mediaRecorder.state!=='inactive')mediaRecorder.stop();
-  document.getElementById('rec').disabled=false;
-  document.getElementById('stop').disabled=true;
-}
-load();
-</script>
-</body>
-</html>"""
+function clearText(){document.getElementById('text').value=''}
+async function tts(){const text=document.getElementById('text').value.trim();if(!text)return status('Matn yozing.');status('⏳ Ovoz tayyorlanmoqda...');try{const r=await fetch('/api/tts',{method:'POST',headers:H(),body:JSON.stringify({text})});if(!r.ok){const e=await r.json();throw Error(e.error)}const blob=await r.blob(),url=URL.createObjectURL(blob);const p=document.getElementById('player');p.src=url;p.classList.remove('hide');p.play().catch(()=>{});status('✅ Tayyor.');load()}catch(e){status('❌ '+e.message)}}
+let mediaRecorder,chunks=[];async function startRecord(){try{const s=await navigator.mediaDevices.getUserMedia({audio:true});chunks=[];mediaRecorder=new MediaRecorder(s);mediaRecorder.ondataavailable=e=>e.data.size&&chunks.push(e.data);mediaRecorder.onstop=async()=>{s.getTracks().forEach(t=>t.stop());const fd=new FormData();fd.append('audio',new Blob(chunks,{type:mediaRecorder.mimeType||'audio/webm'}),'voice.webm');status('⏳ Aniqlanmoqda...');try{const r=await fetch('/api/stt',{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:fd});const d=await r.json();if(!r.ok)throw Error(d.error);document.getElementById('sttResult').textContent='📝 '+d.text;status('✅ Tayyor.');load()}catch(e){status('❌ '+e.message)}};mediaRecorder.start();rec.disabled=true;stop.disabled=false;status('🔴 Yozilmoqda...')}catch(e){status('❌ Mikrofon ruxsati kerak.')}}
+function stopRecord(){if(mediaRecorder&&mediaRecorder.state!=='inactive')mediaRecorder.stop();rec.disabled=false;stop.disabled=true}
+async function loadModels(){const d=await api('/api/models');document.getElementById('modelList').innerHTML=d.models.length?d.models.map(m=>`<div class="model ${selectedModel===m.id?'sel':''}" onclick="selectModel(${m.id})"><strong>${m.kind==='video'?'🎬':'🖼️'} ${m.name}</strong><small>${m.description||''} · ${m.price.toLocaleString()} so‘m</small></div>`).join(''):'<div class="hint">Hozircha model yoqilmagan.</div>';if(!selectedModel&&d.models[0])selectModel(d.models[0].id)}
+async function selectModel(id){selectedModel=id;await loadModels()}
+async function generate(){if(!selectedModel)return status('Model tanlang.');const p=document.getElementById('prompt').value.trim();if(!p)return status('Prompt yozing.');document.getElementById('genStatus').textContent='⏳ Navbatga qo‘shilmoqda...';try{const d=await api('/api/generate',{method:'POST',body:JSON.stringify({model_id:selectedModel,prompt:p,negative:document.getElementById('negative').value,size:document.getElementById('size').value})});document.getElementById('genStatus').textContent='✅ #'+d.job_id+' navbatga qo‘shildi. Worker tayyorlagach botga yuboriladi.';loadJobs();load()}catch(e){document.getElementById('genStatus').textContent='❌ '+e.message}}
+async function loadJobs(){try{const d=await api('/api/jobs');document.getElementById('jobs').innerHTML=d.jobs.length?d.jobs.map(j=>`<div class="job"><div class="jobtop"><b>#${j.id} · ${j.model}</b><span class="${j.status==='done'?'ok':j.status==='failed'?'bad':'wait'}">${j.status}</span></div><div class="hint">${j.cost.toLocaleString()} so‘m · ${new Date(j.created*1000).toLocaleString()}</div>${j.error?`<div class="danger">${j.error}</div>`:''}</div>`).join(''):'Hozircha generatsiya yo‘q.'}catch(e){}}
+async function topup(){const a=Number(document.getElementById('customAmount').value);if(!a)return;document.getElementById('payStatus').textContent='⏳ So‘rov...';try{const d=await api('/api/topup',{method:'POST',body:JSON.stringify({amount:a})});document.getElementById('payStatus').textContent='✅ So‘rov #'+d.payment_id+' yuborildi. Chekni botga yuboring.'}catch(e){document.getElementById('payStatus').textContent='❌ '+e.message}}
+function copyRef(){navigator.clipboard?.writeText(document.getElementById('refLink').value);status('Referal havola nusxalandi.')}
+async function adminLoad(){try{const d=await api('/api/admin/overview');document.getElementById('astats').innerHTML=`<div class="kv"><span>Users</span><b>${d.users}</b></div><div class="kv"><span>Balanslar jami</span><b>${d.balance.toLocaleString()} so‘m</b></div><div class="kv"><span>Queued</span><b>${d.queued}</b></div><div class="kv"><span>Worker</span><b>${d.worker}</b></div>`;document.getElementById('amodels').innerHTML=d.models.map(m=>`<div class="kv"><span>${m.kind==='video'?'🎬':'🖼️'} ${m.name}<br><small>${m.enabled?'ON':'OFF'} · ${m.price.toLocaleString()} so‘m</small></span><b><button class="btn" style="width:auto;padding:7px" onclick='editModel(${JSON.stringify(m)})'>✏️</button> <button class="btn" style="width:auto;padding:7px" onclick='toggleModel(${m.id})'>${m.enabled?'OFF':'ON'}</button></b></div>`).join('');document.getElementById('workerName').value=d.worker_name||'';status('Admin ma’lumotlari yangilandi.')}catch(e){status('❌ '+e.message)}}
+async function adminToggle(){try{const d=await api('/api/admin/toggle',{method:'POST',body:'{}'});status(d.message)}catch(e){status('❌ '+e.message)}}
+async function saveWorker(){try{const d=await api('/api/admin/worker',{method:'POST',body:JSON.stringify({name:document.getElementById('workerName').value,key:document.getElementById('workerKey').value})});status(d.message)}catch(e){status('❌ '+e.message)}}
+function clearModel(){mid.value='';mname.value='';mprice.value='';mworkflow.value='';mkind.value='image'}
+function editModel(m){mid.value=m.id;mname.value=m.name;mkind.value=m.kind;mprice.value=m.price;status('Model tanlandi. Workflowni tahrirlab saqlang.')}
+async function toggleModel(id){try{const d=await api('/api/admin/model/'+id+'/toggle',{method:'POST',body:'{}'});status(d.message);adminLoad();loadModels()}catch(e){status('❌ '+e.message)}}
+async function saveModel(){try{const d=await api('/api/admin/model',{method:'POST',body:JSON.stringify({id:Number(mid.value)||0,name:mname.value,kind:mkind.value,price:Number(mprice.value)||0,enabled:true,workflow:mworkflow.value})});status(d.message);clearModel();adminLoad();loadModels()}catch(e){status('❌ '+e.message)}}
+load();setInterval(loadJobs,5000);
+</script></body></html>"""
 
 flask_app = Flask(__name__)
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
@@ -1284,13 +1250,19 @@ def api_me():
         uid, user, u = _api_auth()
         refs = int(one("SELECT refs FROM users WHERE id=?", (uid,)))
         ch = tts_choice(uid)
+        amounts=[int(x) for x in S("amounts").split(",") if x.strip()]
+        ref_link=(f"https://t.me/{BOT_USERNAME}?start=ref_{uid}" if BOT_USERNAME else "")
         return jsonify({
             "id": uid,
             "first_name": user.get("first_name", ""),
             "balance": int(u["bal"]),
             "refs": refs,
             "language": ch[1] if ch else "-",
-            "voice": ch[2] if ch else "-"
+            "voice": ch[2] if ch else "-",
+            "is_admin": is_admin(uid),
+            "amounts": amounts,
+            "ref_link": ref_link,
+            "pay_info": f"Karta: {S('card_number')}\nEgasi: {S('card_owner')}"
         })
     except ValueError as e:
         return jsonify({"error": str(e)}), 401
@@ -1404,6 +1376,155 @@ def api_stt():
     finally:
         if tmp:
             shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ============ AI / ADMIN API ============
+def _admin_auth():
+    uid, user, u = _api_auth()
+    if not is_admin(uid):
+        raise ValueError("Faqat admin uchun.")
+    return uid, user, u
+
+def _json_int(v, default=0):
+    try: return int(float(v))
+    except Exception: return default
+
+def _worker_key_ok():
+    key=os.getenv("WORKER_KEY", "").strip() or S("worker_key")
+    got=request.headers.get("X-Worker-Key", "").strip()
+    return bool(key) and hmac.compare_digest(got, key)
+
+@flask_app.route('/api/models')
+def api_models():
+    try:
+        _api_auth()
+        rows=db.execute("SELECT id,name,kind,price,description FROM ai_models WHERE enabled=1 ORDER BY kind,id").fetchall()
+        return jsonify({'models':[{'id':r[0],'name':r[1],'kind':r[2],'price':r[3],'description':r[4]} for r in rows]})
+    except ValueError as e: return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/generate',methods=['POST'])
+def api_generate():
+    try:
+        uid,_,u=_api_auth(); d=request.get_json(silent=True) or {}
+        mid=_json_int(d.get('model_id')); prompt=str(d.get('prompt','')).strip(); neg=str(d.get('negative','')).strip(); size=str(d.get('size','1024x1024'))
+        if not prompt:return jsonify({'error':'Prompt bo‘sh.'}),400
+        if len(prompt)>Si('gen_max_prompt'):return jsonify({'error':'Prompt juda uzun.'}),400
+        row=db.execute("SELECT id,name,kind,price,enabled FROM ai_models WHERE id=?",(mid,)).fetchone()
+        if not row or not row[4]:return jsonify({'error':'Model mavjud emas yoki o‘chirilgan.'}),404
+        cost=int(row[3]);
+        db.execute('BEGIN IMMEDIATE')
+        cur=db.execute('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?',(cost,uid,cost))
+        if cur.rowcount!=1: db.rollback(); return jsonify({'error':f'Balans yetarli emas. Kerak: {cost:,} so‘m.'}),402
+        now=int(time.time()); cur=db.execute("INSERT INTO ai_jobs(uid,model_id,prompt,negative,params,status,cost,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",(uid,mid,prompt,neg,json.dumps({'size':size},ensure_ascii=False),'queued',cost,now,now)); jid=cur.lastrowid; db.commit()
+        return jsonify({'job_id':jid,'cost':cost,'status':'queued'})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+    except Exception:
+        db.rollback();logging.exception('api_generate');return jsonify({'error':'Generatsiya navbatiga qo‘shishda xato.'}),500
+
+@flask_app.route('/api/jobs')
+def api_jobs():
+    try:
+        uid,_,_= _api_auth(); rows=db.execute("SELECT j.id,m.name,j.status,j.cost,j.error,j.created FROM ai_jobs j JOIN ai_models m ON m.id=j.model_id WHERE j.uid=? ORDER BY j.id DESC LIMIT 30",(uid,)).fetchall()
+        return jsonify({'jobs':[{'id':r[0],'model':r[1],'status':r[2],'cost':r[3],'error':r[4],'created':r[5]} for r in rows]})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/topup',methods=['POST'])
+def api_topup():
+    try:
+        uid,_,_= _api_auth(); d=request.get_json(silent=True) or {}; amount=_json_int(d.get('amount'))
+        if amount<Si('min_topup'):return jsonify({'error':f'Minimum {fmt(Si("min_topup"))} so‘m.'}),400
+        cur=db.execute("INSERT INTO payments(uid,amount,status) VALUES(?,?,?)",(uid,amount,'wait'));db.commit();return jsonify({'payment_id':cur.lastrowid})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/admin/overview')
+def api_admin_overview():
+    try:
+        _admin_auth(); models=db.execute("SELECT id,name,kind,price,enabled FROM ai_models ORDER BY kind,id").fetchall()
+        return jsonify({'users':one('SELECT COUNT(*) FROM users'),'balance':one('SELECT COALESCE(SUM(balance),0) FROM users'),'queued':one("SELECT COUNT(*) FROM ai_jobs WHERE status IN ('queued','running')"),'worker':S('worker_name'),'worker_name':S('worker_name'),'models':[{'id':r[0],'name':r[1],'kind':r[2],'price':r[3],'enabled':bool(r[4])} for r in models]})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/admin/toggle',methods=['POST'])
+def api_admin_toggle():
+    try:
+        _admin_auth(); val='0' if S('bot_on')=='1' else '1';set_cfg('bot_on',val);return jsonify({'message':'Bot yoqildi.' if val=='1' else 'Bot vaqtincha o‘chirildi.'})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/admin/worker',methods=['POST'])
+def api_admin_worker():
+    try:
+        _admin_auth();d=request.get_json(silent=True) or {};name=str(d.get('name','local-gpu-1')).strip()[:80];key=str(d.get('key','')).strip()
+        set_cfg('worker_name',name or 'local-gpu-1')
+        if key:set_cfg('worker_key',key)
+        return jsonify({'message':'Worker sozlamalari saqlandi.'})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/admin/model',methods=['POST'])
+def api_admin_model():
+    try:
+        _admin_auth();d=request.get_json(silent=True) or {};mid=_json_int(d.get('id'));name=str(d.get('name','')).strip();kind=str(d.get('kind','image')).lower();price=_json_int(d.get('price'),1000);enabled=1 if d.get('enabled') else 0;workflow=str(d.get('workflow',''))
+        if not name or kind not in ('image','video') or price<0:return jsonify({'error':'Model ma’lumotlari noto‘g‘ri.'}),400
+        if mid:db.execute("UPDATE ai_models SET name=?,kind=?,price=?,enabled=?,workflow=? WHERE id=?",(name,kind,price,enabled,workflow,mid))
+        else:db.execute("INSERT INTO ai_models(name,kind,price,enabled,description,workflow,created) VALUES(?,?,?,?,?,?,?)",(name,kind,price,enabled,str(d.get('description','')),workflow,int(time.time())))
+        db.commit();return jsonify({'message':'Model saqlandi.'})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+    except Exception as e:return jsonify({'error':'Model saqlanmadi: '+str(e)}),400
+
+@flask_app.route('/api/admin/model/<int:mid>/toggle',methods=['POST'])
+def api_admin_model_toggle(mid):
+    try:
+        _admin_auth();r=db.execute('SELECT enabled FROM ai_models WHERE id=?',(mid,)).fetchone()
+        if not r:return jsonify({'error':'Model topilmadi.'}),404
+        db.execute('UPDATE ai_models SET enabled=? WHERE id=?',(0 if r[0] else 1,mid));db.commit();return jsonify({'message':'Model holati yangilandi.'})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/worker/next')
+def worker_next():
+    if not _worker_key_ok():return jsonify({'error':'worker auth'}),401
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute("SELECT j.id,j.uid,j.model_id,j.prompt,j.negative,j.params,m.name,m.kind,m.workflow FROM ai_jobs j JOIN ai_models m ON m.id=j.model_id WHERE j.status='queued' AND m.enabled=1 ORDER BY j.id LIMIT 1").fetchone()
+        if not row:db.rollback();return jsonify({'job':None})
+        jid,uid,mid,prompt,negative,params,name,kind,workflow=row
+        db.execute("UPDATE ai_jobs SET status='running',worker_id=?,updated=? WHERE id=?",(S('worker_name'),int(time.time()),jid));db.commit()
+        return jsonify({'job':{'id':jid,'uid':uid,'model_id':mid,'prompt':prompt,'negative':negative,'params':json.loads(params or '{}'),'name':name,'kind':kind,'workflow':workflow or ''}})
+    except Exception:db.rollback();logging.exception('worker_next');return jsonify({'error':'queue error'}),500
+
+@flask_app.route('/worker/result',methods=['POST'])
+def worker_result():
+    if not _worker_key_ok():return jsonify({'error':'worker auth'}),401
+    jid=_json_int(request.form.get('job_id'));status=request.form.get('status','failed');err=str(request.form.get('error',''))[:1000];f=request.files.get('file')
+    row=db.execute('SELECT uid,cost,result_type FROM ai_jobs WHERE id=?',(jid,)).fetchone()
+    if not row:return jsonify({'error':'job not found'}),404
+    uid,cost,_=row
+    try:
+        if status=='done' and f:
+            ext=os.path.splitext(f.filename or '')[1].lower() or ('.mp4' if request.form.get('type')=='video' else '.png')
+            root='/tmp/ai_results';os.makedirs(root,exist_ok=True);path=os.path.join(root,f'{jid}{ext}');f.save(path)
+            db.execute("UPDATE ai_jobs SET status='done',result_path=?,result_type=?,error='',updated=? WHERE id=?",(path,request.form.get('type','image'),int(time.time()),jid));db.commit()
+            # Send the finished media through Telegram; Render only holds a short-lived copy.
+            try:
+                if request.form.get('type')=='video':
+                    with open(path,'rb') as fh: asyncio.run(bot_send_video(uid,fh,caption=f'🎬 # {jid} Tayyor'))
+                else:
+                    with open(path,'rb') as fh: asyncio.run(bot_send_photo(uid,fh,caption=f'🖼️ #{jid} Tayyor'))
+            except Exception as e: logging.exception('telegram delivery');
+            return jsonify({'ok':True})
+        db.execute("UPDATE ai_jobs SET status='failed',error=?,updated=? WHERE id=?",(err or 'Worker xatosi',int(time.time()),jid));db.commit();add_bal(uid,cost);return jsonify({'ok':True,'refunded':cost})
+    except Exception:logging.exception('worker_result');return jsonify({'error':'result error'}),500
+
+async def bot_send_photo(uid,fh,caption=''):
+    # Temporary standalone bot client for worker callback; token never leaves server-side code.
+    from telegram import Bot
+    async with Bot(TOKEN) as b: await b.send_photo(chat_id=uid,photo=fh,caption=caption)
+
+async def bot_send_video(uid,fh,caption=''):
+    from telegram import Bot
+    async with Bot(TOKEN) as b: await b.send_video(chat_id=uid,video=fh,caption=caption,supports_streaming=True)
+
+@flask_app.route('/admin')
+def admin_page():
+    # Admin uses the same authenticated Mini App UI; opening /admin from Telegram keeps initData available.
+    return WEB_APP_HTML
 
 def keep_alive():
     port = int(os.getenv("PORT", "8080"))

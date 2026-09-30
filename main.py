@@ -1,16 +1,5 @@
 import os, sys, subprocess
 
-def _need(mod, pkg):
-    try:
-        __import__(mod)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-for _m, _p in [("telegram", "python-telegram-bot==21.6"), ("edge_tts", "edge-tts"),
-               ("speech_recognition", "SpeechRecognition"),
-               ("imageio_ffmpeg", "imageio-ffmpeg"), ("flask", "flask")]:
-    _need(_m, _p)
-
 import re, math, time, html, shutil, sqlite3, asyncio, tempfile, threading, logging, json, hmac, hashlib, urllib.parse, io
 from telegram import (Update, InlineKeyboardButton as B, InlineKeyboardMarkup as M,
                       ReplyKeyboardMarkup, KeyboardButton, WebAppInfo)
@@ -73,7 +62,27 @@ DEFAULT_LANGS = [
 ]
 
 # ---------------- DB ----------------
-db = sqlite3.connect("bot.db", check_same_thread=False)
+class ThreadDB:
+    """Separate SQLite connection per Flask/Telegram thread; WAL for safe concurrent reads."""
+    def __init__(self,filename):
+        self.filename=filename
+        self.local=threading.local()
+    def conn(self):
+        c=getattr(self.local,'connection',None)
+        if c is None:
+            c=sqlite3.connect(self.filename,timeout=30,check_same_thread=True)
+            c.execute('PRAGMA busy_timeout=30000')
+            c.execute('PRAGMA journal_mode=WAL')
+            self.local.connection=c
+        return c
+    def execute(self,*a,**kw):return self.conn().execute(*a,**kw)
+    def executescript(self,*a,**kw):return self.conn().executescript(*a,**kw)
+    def commit(self):return self.conn().commit()
+    def rollback(self):return self.conn().rollback()
+    def __enter__(self):return self.conn().__enter__()
+    def __exit__(self,*a):return self.conn().__exit__(*a)
+
+db = ThreadDB(os.getenv('DB_PATH','bot.db'))
 db.executescript("""
 CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, balance INTEGER DEFAULT 0,
   lang TEXT DEFAULT 'uz', voice INTEGER DEFAULT 0, ref_by INTEGER, refs INTEGER DEFAULT 0);
@@ -91,6 +100,11 @@ for _col in ("banned INTEGER DEFAULT 0", "uname TEXT", "stt_lang TEXT DEFAULT 'u
         db.execute("ALTER TABLE users ADD COLUMN " + _col)
     except sqlite3.OperationalError:
         pass
+try:
+    db.execute("ALTER TABLE payments ADD COLUMN receipt_sent INTEGER DEFAULT 0")
+except sqlite3.OperationalError:
+    pass
+
 if not db.execute("SELECT 1 FROM langs").fetchone():
     for _i, (_code, _name, _stt, _vs) in enumerate(DEFAULT_LANGS):
         db.execute("INSERT INTO langs(code,name,stt,pos) VALUES(?,?,?,?)", (_code, _name, _stt, _i))
@@ -158,7 +172,8 @@ DEF = {"tts_price": "0.3", "stt_sec": "5", "start_bonus": "2000", "ref_bonus": "
        "bot_on": "1", "card_number": CARD_NUMBER, "card_owner": CARD_OWNER,
        "worker_enabled": "0", "worker_name": "local-gpu-1", "worker_poll_seconds": "2",
        "worker_note": "ComfyUI lokal GPU worker", "image_default_size": "1024x1024",
-       "gen_max_prompt": "2000", "worker_key": os.getenv("WORKER_KEY", "") }
+       "gen_max_prompt": "2000", "worker_key": os.getenv("WORKER_KEY", ""),
+       "worker_last_seen": "0", "worker_default_image": "0" }
 SETS = {
  "tts_price": ("TTS narxi (so'm/belgi)", "num"),
  "stt_sec": ("STT narxi (so'm/soniya)", "num"),
@@ -263,6 +278,8 @@ def menu_kb():
             [KeyboardButton(T("btn_tts"))],
             [KeyboardButton(T("btn_bal")), KeyboardButton(T("btn_top"))],
             [KeyboardButton(T("btn_ref"))]]
+    rows.extend([[KeyboardButton("🎨 AI rasm"), KeyboardButton("🎬 AI video")],
+                 [KeyboardButton("🧾 Buyurtmalar"), KeyboardButton("⚙️ Sozlamalar")]])
     if WEB_APP_URL:
         rows.append([KeyboardButton("🚀 Mini App", web_app=WebAppInfo(url=WEB_APP_URL))])
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -419,6 +436,33 @@ async def text_h(u: Update, c: ContextTypes.DEFAULT_TYPE):
         n = one("SELECT refs FROM users WHERE id=?", (uid,))
         await u.message.reply_text(T("ref", bonus=fmt(Si("ref_bonus")),
                                      link=f"https://t.me/{me.username}?start=ref_{uid}", n=n))
+    elif t in ("🎨 AI rasm", "🎬 AI video"):
+        kind = "image" if t == "🎨 AI rasm" else "video"
+        enabled = db.execute("SELECT id,name,price FROM ai_models WHERE enabled=1 AND kind=? ORDER BY id", (kind,)).fetchall()
+        if not enabled:
+            await u.message.reply_text("Hozir bu xizmat uchun faol model yo‘q. Admin uni sozlab yoqishi kerak.", reply_markup=menu_kb())
+        else:
+            kb = [[B(f"{r[1]} · {fmt(r[2])} so‘m", callback_data=f"ai:{r[0]}")] for r in enabled[:30]]
+            await u.message.reply_text("Modelni tanlang:", reply_markup=M(kb))
+    elif t == "🧾 Buyurtmalar":
+        jobs = db.execute("SELECT j.id,m.name,j.status,j.error FROM ai_jobs j JOIN ai_models m ON m.id=j.model_id WHERE j.uid=? ORDER BY j.id DESC LIMIT 8", (uid,)).fetchall()
+        txt = "\n".join(f"#{i} {n}: {st}" + (f" ({err[:70]})" if err else "") for i,n,st,err in jobs) or "Buyurtmalar yo‘q."
+        await u.message.reply_text(txt)
+    elif t == "⚙️ Sozlamalar":
+        await u.message.reply_text("Til va ovozni o‘zgartiring:", reply_markup=M([[B("🌐 TTS tili/ovozi",callback_data="chg"),B("🎙 STT tili",callback_data="stt_lang")]]))
+    elif t == "🚀 Mini App":
+        if WEB_APP_URL:
+            await u.message.reply_text("Ilovani oching:", reply_markup=M([[B("🚀 Mini App",web_app=WebAppInfo(url=WEB_APP_URL))]]))
+        else: await u.message.reply_text("Mini App manzili sozlanmagan.")
+    elif t == "👑 Admin Mini App" and is_admin(uid):
+        if WEB_APP_URL:
+            await u.message.reply_text("Admin panel:", reply_markup=M([[B("👑 Admin",web_app=WebAppInfo(url=WEB_APP_URL))]]))
+    elif ud.get("mode") == "ai_prompt":
+        mid=ud.pop("ai_model",None); ud.pop("mode",None)
+        if not mid:
+            await u.message.reply_text("Modelni qayta tanlang."); return
+        result,code=create_ai_job(uid,mid,t)
+        await u.message.reply_text(result if code != 200 else f"✅ Buyurtma #{result} qabul qilindi. Natija tayyor bo‘lsa, shu yerga yuboriladi.", reply_markup=menu_kb())
     elif ud.get("mode") == "tts":
         await tts_confirm(u, c, t)
     elif ud.get("mode") == "amount":
@@ -544,6 +588,7 @@ async def photo_h(u: Update, c: ContextTypes.DEFAULT_TYPE):
         db.execute("DELETE FROM payments WHERE id=?", (pid,)); db.commit()
         await m.reply_text(T("chek_fail"))
         return
+    db.execute("UPDATE payments SET receipt_sent=1 WHERE id=?",(pid,));db.commit()
     c.user_data.clear()
     await m.reply_text(T("chek_sent"), reply_markup=menu_kb())
 
@@ -559,7 +604,7 @@ async def cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
             await q.answer(); return
         pid = int(d[4:])
         ok = d.startswith("pok:")
-        cur = db.execute("UPDATE payments SET status=? WHERE id=? AND status='wait'",
+        cur = db.execute("UPDATE payments SET status=? WHERE id=? AND status='wait' AND receipt_sent=1",
                          ("ok" if ok else "no", pid))
         db.commit()
         if cur.rowcount == 0:
@@ -593,6 +638,14 @@ async def cb(u: Update, c: ContextTypes.DEFAULT_TYPE):
         return
 
     await q.answer()
+
+    if d.startswith("ai:"):
+        mid=int(d[3:]); row=db.execute("SELECT name,price FROM ai_models WHERE id=? AND enabled=1",(mid,)).fetchone()
+        if not row:
+            await q.message.reply_text("Model faol emas."); return
+        c.user_data["mode"]="ai_prompt"; c.user_data["ai_model"]=mid
+        await q.message.reply_text(f"🤖 {row[0]} (narx: {fmt(row[1])} so‘m)\nNima yaratishni yozing:")
+        return
 
     if d.startswith("a:"):
         if is_admin(uid):
@@ -676,6 +729,7 @@ def panel_kb():
         [B("✏️ Matnlar/tugmalar", callback_data="a:txt:0"), B("⚙️ Narx/bonus/karta", callback_data="a:set")],
         [B("📨 Xabar yuborish", callback_data="a:bc"), B("💳 To'lovlar", callback_data="a:pay")],
         [B("👮 Adminlar", callback_data="a:adm"), B("🤖 Bot: YOQIQ ✅" if on else "🤖 Bot: O'CHIQ 🚫", callback_data="a:bot")],
+        *([[B("🚀 AI/Admin Mini App", web_app=WebAppInfo(url=WEB_APP_URL))]] if WEB_APP_URL else []),
     ])
 
 HOME = [[B("⬅️ Panel", callback_data="a:home")]]
@@ -1132,7 +1186,7 @@ async def msg_h(u: Update, c: ContextTypes.DEFAULT_TYPE):
     us = u.effective_user
     touch(us)
     if is_admin(us.id) and c.user_data.get("adm"):
-        if m.text and m.text in [T(k) for k in MENU_KEYS]:
+        if m.text and m.text in [T(k) for k in MENU_KEYS] + ["🎨 AI rasm", "🎬 AI video", "🧾 Buyurtmalar", "⚙️ Sozlamalar", "🚀 Mini App", "👑 Admin Mini App"]:
             c.user_data.pop("adm", None)
         elif await admin_input(u, c):
             return
@@ -1155,49 +1209,68 @@ WEB_APP_HTML = r"""<!doctype html>
 <title>Voice Studio AI</title><script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{--bg:#070b14;--card:#101827;--card2:#0d1420;--text:#f7f9fc;--muted:#8f9db2;--line:#1d2a3d;--a:#6c7cff;--b:#35d6c8;--danger:#ff6678}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#18244b 0,#070b14 42%),#070b14;color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0}.wrap{max-width:760px;margin:auto;padding:18px 14px 42px}.hero{padding:18px 4px 12px}.brand{font-weight:900;font-size:24px}.sub{color:var(--muted);font-size:13px;margin-top:5px}.balance{margin-top:16px;background:linear-gradient(135deg,#151f38,#0d1627);border:1px solid var(--line);border-radius:22px;padding:18px;display:flex;justify-content:space-between;align-items:center}.balnum{font-size:25px;font-weight:900}.pill{padding:7px 10px;border-radius:999px;background:#19243b;color:#b9c6ff;font-size:12px}.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}.tab{background:#101827;color:#aeb9ca;border:1px solid var(--line);border-radius:14px;padding:11px 6px}.tab.active{background:linear-gradient(135deg,#2a3568,#16263e);color:#fff;border-color:#5365b8}.panel{display:none}.panel.active{display:block}.card{background:rgba(16,24,39,.92);border:1px solid var(--line);border-radius:20px;padding:15px;margin:10px 0}.title{font-weight:800;margin-bottom:10px}.hint{font-size:12px;color:var(--muted);line-height:1.5}.textarea,.input,.select{width:100%;background:#09111d;border:1px solid #223047;color:#fff;border-radius:14px;padding:13px;outline:none}.textarea{min-height:130px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.btn{width:100%;padding:12px 14px;border-radius:13px;background:#202c43;color:#fff;font-weight:800}.btn.primary{background:linear-gradient(135deg,#6677ff,#3d53d8)}.btn.green{background:linear-gradient(135deg,#18bba9,#158c83)}.btn.red{background:#43202a;color:#ffb7c1}.btn:disabled{opacity:.45}.status{min-height:20px;color:#a9b7ca;font-size:13px;margin-top:10px}.audio{width:100%;margin-top:10px}.models{display:grid;gap:8px}.model{border:1px solid var(--line);border-radius:14px;padding:12px;background:#0b1320}.model strong{display:block}.model small{color:var(--muted)}.model.sel{border-color:#6677ff;background:#141d38}.job{padding:12px;border:1px solid var(--line);border-radius:14px;margin:7px 0}.jobtop{display:flex;justify-content:space-between}.ok{color:#50d5a7}.wait{color:#ffc866}.bad{color:#ff7586}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(7,11,20,.96);border-top:1px solid var(--line);padding:9px 10px;display:grid;grid-template-columns:repeat(4,1fr);gap:7px}.nav button{background:transparent;color:#8290a6;padding:7px 3px;font-size:11px}.nav button.active{color:#fff}.adminbox{border:1px solid #354d7c;background:#0e1930}.hide{display:none!important}.kv{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #1b2738;font-size:13px}.kv:last-child{border:0}.danger{color:#ff7a8a}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 20% 0%,#18244b 0,#070b14 42%),#070b14;color:var(--text);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif}button,input,textarea,select{font:inherit}button{cursor:pointer;border:0}.wrap{max-width:760px;margin:auto;padding:18px 14px 90px}.hero{padding:18px 4px 12px}.brand{font-weight:900;font-size:24px}.sub{color:var(--muted);font-size:13px;margin-top:5px}.balance{margin-top:16px;background:linear-gradient(135deg,#151f38,#0d1627);border:1px solid var(--line);border-radius:22px;padding:18px;display:flex;justify-content:space-between;align-items:center}.balnum{font-size:25px;font-weight:900}.pill{padding:7px 10px;border-radius:999px;background:#19243b;color:#b9c6ff;font-size:12px}.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:14px 0}.tab{background:#101827;color:#aeb9ca;border:1px solid var(--line);border-radius:14px;padding:11px 6px}.tab.active{background:linear-gradient(135deg,#2a3568,#16263e);color:#fff;border-color:#5365b8}.panel{display:none}.panel.active{display:block}.card{background:rgba(16,24,39,.92);border:1px solid var(--line);border-radius:20px;padding:15px;margin:10px 0}.title{font-weight:800;margin-bottom:10px}.hint{font-size:12px;color:var(--muted);line-height:1.5}.textarea,.input,.select{width:100%;background:#09111d;border:1px solid #223047;color:#fff;border-radius:14px;padding:13px;outline:none}.textarea{min-height:130px;resize:vertical}.row{display:grid;grid-template-columns:1fr 1fr;gap:9px}.btn{width:100%;padding:12px 14px;border-radius:13px;background:#202c43;color:#fff;font-weight:800}.btn.primary{background:linear-gradient(135deg,#6677ff,#3d53d8)}.btn.green{background:linear-gradient(135deg,#18bba9,#158c83)}.btn.red{background:#43202a;color:#ffb7c1}.btn:disabled{opacity:.45}.status{min-height:20px;color:#a9b7ca;font-size:13px;margin-top:10px}.audio{width:100%;margin-top:10px}.models{display:grid;gap:8px}.model{border:1px solid var(--line);border-radius:14px;padding:12px;background:#0b1320}.model strong{display:block}.model small{color:var(--muted)}.model.sel{border-color:#6677ff;background:#141d38}.job{padding:12px;border:1px solid var(--line);border-radius:14px;margin:7px 0}.jobtop{display:flex;justify-content:space-between}.ok{color:#50d5a7}.wait{color:#ffc866}.bad{color:#ff7586}.nav{position:fixed;bottom:0;left:0;right:0;background:rgba(7,11,20,.96);border-top:1px solid var(--line);padding:9px 10px;display:grid;grid-template-columns:repeat(5,1fr);gap:5px}.nav button{background:transparent;color:#8290a6;padding:7px 3px;font-size:11px}.nav button.active{color:#fff}.adminbox{border:1px solid #354d7c;background:#0e1930}.hide{display:none!important}.kv{display:flex;justify-content:space-between;padding:9px 0;border-bottom:1px solid #1b2738;font-size:13px}.kv:last-child{border:0}.danger{color:#ff7a8a}
 </style></head><body><div class="wrap">
 <div class="hero"><div class="brand">⚡ Voice Studio AI</div><div class="sub" id="hello">Yuklanmoqda...</div></div>
 <div class="balance"><div><div class="sub">Mening balansim</div><div class="balnum" id="bal">0 so‘m</div></div><div class="pill" id="refs">0 referal</div></div>
 <div id="home" class="panel active"><div class="tabs"><button class="tab active" onclick="mode('tts',this)">🔊 TTS</button><button class="tab" onclick="mode('stt',this)">🎙 STT</button><button class="tab" onclick="mode('gen',this)">🎨 AI</button></div>
 <div id="tts" class="card tool"><div class="title">🔊 Matn → tabiiy ovoz</div><textarea id="text" class="textarea" placeholder="Ovozga aylantiriladigan matn..."></textarea><div class="row" style="margin-top:9px"><button class="btn primary" onclick="tts()">Ovoz yaratish</button><button class="btn" onclick="clearText()">Tozalash</button></div><audio id="player" class="audio hide" controls></audio></div>
-<div id="stt" class="card tool hide"><div class="title">🎙 Ovoz → matn</div><div class="hint">Brauzer mikrofonidan yozib, matnga aylantiring.</div><div class="row" style="margin-top:10px"><button class="btn primary" id="rec" onclick="startRecord()">🔴 Yozish</button><button class="btn" id="stop" onclick="stopRecord()" disabled>⏹ To‘xtatish</button></div><div id="sttResult" class="card" style="margin-top:10px">Natija shu yerda chiqadi.</div></div>
-<div id="gen" class="card tool hide"><div class="title">🎨 AI rasm / 🎬 video</div><div id="modelList" class="models"></div><textarea id="prompt" class="textarea" style="margin-top:10px;min-height:100px" placeholder="Nima yaratilsin? Masalan: cinematic Uzbek city at sunset..."></textarea><input id="negative" class="input" style="margin-top:9px" placeholder="Negative prompt (ixtiyoriy)"><div class="row" style="margin-top:9px"><select id="size" class="select"><option>1024x1024</option><option>768x1024</option><option>1024x768</option><option>512x512</option></select><button class="btn primary" onclick="generate()">🚀 Yaratish</button></div><div id="genStatus" class="status"></div></div>
-<div class="card"><div class="title">⚙️ Joriy sozlamalar</div><div class="kv"><span>Til</span><b id="lang">-</b></div><div class="kv"><span>Ovoz</span><b id="voice">-</b></div></div></div>
-<div id="balancePanel" class="panel"><div class="card"><div class="title">💳 Balansni to‘ldirish</div><div class="hint" id="payInfo">-</div><div id="amounts" class="row" style="margin-top:10px"></div><input id="customAmount" class="input" style="margin-top:9px" placeholder="Boshqa summa"><button class="btn primary" style="margin-top:9px" onclick="topup()">To‘ldirish so‘rovini yuborish</button><div class="status" id="payStatus"></div></div></div>
+<div id="stt" class="card tool hide"><div class="title">🎙 Ovoz → matn</div><div class="hint">Brauzer mikrofonidan yozib, matnga aylantiring.</div><div class="row" style="margin-top:10px"><button class="btn primary" id="rec" onclick="startRecord()">🔴 Yozish</button><button class="btn" id="stop" onclick="stopRecord()" disabled>⏹ To‘xtatish</button></div><input type="file" id="sttFile" accept="audio/*" class="input" style="margin-top:10px"><button class="btn" style="margin-top:8px" onclick="sttUpload()">📁 Audio faylni matnga aylantirish</button><div id="sttResult" class="card" style="margin-top:10px">Natija shu yerda chiqadi.</div></div>
+<div id="gen" class="card tool hide"><div class="title">🎨 AI rasm / 🎬 video</div><div id="workerStatus" class="hint" style="margin-bottom:10px">Generator tekshirilmoqda...</div><div id="modelList" class="models"></div><textarea id="prompt" class="textarea" style="margin-top:10px;min-height:100px" placeholder="Nima yaratilsin? Masalan: cinematic Uzbek city at sunset..."></textarea><input id="negative" class="input" style="margin-top:9px" placeholder="Negative prompt (ixtiyoriy)"><div class="row" style="margin-top:9px"><select id="size" class="select"><option>1024x1024</option><option>768x1024</option><option>1024x768</option><option>512x512</option></select><button class="btn primary" onclick="generate()">🚀 Yaratish</button></div><div id="genStatus" class="status"></div></div>
+<div class="card"><div class="title">⚙️ Til va ovoz</div><div class="kv"><span>Til</span><b id="lang">-</b></div><div class="kv"><span>Ovoz</span><b id="voice">-</b></div><label class="hint">Matn → ovoz tili</label><select id="ttsLang" class="select" onchange="loadVoices()"></select><label class="hint">Ovoz</label><select id="ttsVoice" class="select"></select><button class="btn" style="margin:8px 0" onclick="saveVoice()">🔊 Ovozni saqlash</button><label class="hint">Ovoz → matn tili</label><select id="sttLang" class="select"></select><button class="btn" style="margin-top:8px" onclick="saveSTTLang()">🎙 Tilni saqlash</button></div></div>
+<div id="balancePanel" class="panel"><div class="card"><div class="title">💳 Balansni to‘ldirish</div><div class="hint" id="payInfo">-</div><div id="amounts" class="row" style="margin-top:10px"></div><input id="customAmount" class="input" style="margin-top:9px" placeholder="Boshqa summa"><button class="btn primary" style="margin-top:9px" onclick="topup()">To‘ldirish so‘rovini yuborish</button><div class="status" id="payStatus"></div><div class="hint" style="margin-top:10px">So‘rov yuborgach, to‘lov chekining rasmini yoki PDF faylini shu yerda jo‘nating.</div><input type="file" id="receipt" class="input" accept="image/*,application/pdf" style="margin-top:8px"><button class="btn green" style="margin-top:8px" onclick="sendReceipt()">📎 Chekni adminga yuborish</button></div></div>
 <div id="refPanel" class="panel"><div class="card"><div class="title">👥 Referal</div><div class="hint">Har bir haqiqiy yangi taklif uchun bonus admin sozlamasidan boshqariladi.</div><input id="refLink" class="input" style="margin-top:10px" readonly><button class="btn primary" style="margin-top:9px" onclick="copyRef()">Havolani nusxalash</button></div></div>
 <div id="jobsPanel" class="panel"><div class="card"><div class="title">🧾 Generatsiyalar</div><div id="jobs">Yuklanmoqda...</div></div></div>
-<div id="adminPanel" class="panel"><div class="card adminbox"><div class="title">👑 Admin panel</div><div class="hint">Narxlar, AI modellar, worker, bot holati va foydalanuvchi balanslari shu yerdan boshqariladi.</div><div class="row" style="margin-top:10px"><button class="btn" onclick="adminLoad()">Yangilash</button><button class="btn red" onclick="adminToggle()">Bot holati</button></div></div><div class="card"><div class="title">📊 Statistika</div><div id="astats">-</div></div><div class="card"><div class="title">🤖 AI modellarni boshqarish</div><div id="amodels">-</div><hr style="border-color:#1d2a3d;border-width:1px 0 0;margin:12px 0"><input id="mid" type="hidden"><input id="mname" class="input" placeholder="Model nomi"><div class="row" style="margin-top:8px"><select id="mkind" class="select"><option value="image">🖼️ image</option><option value="video">🎬 video</option></select><input id="mprice" class="input" type="number" placeholder="Narx"></div><textarea id="mworkflow" class="textarea" style="margin-top:8px;min-height:90px" placeholder="ComfyUI API workflow JSON (video va maxsus modellar uchun)"></textarea><div class="row" style="margin-top:8px"><button class="btn primary" onclick="saveModel()">Modelni saqlash</button><button class="btn" onclick="clearModel()">Tozalash</button></div></div><div class="card"><div class="title">⚙️ Worker</div><input id="workerName" class="input" placeholder="Worker nomi"><input id="workerKey" class="input" style="margin-top:8px" placeholder="Worker key (faqat bir marta ko‘rsatish uchun)"><button class="btn primary" style="margin-top:8px" onclick="saveWorker()">Saqlash</button></div></div>
+<div id="adminPanel" class="panel"><div class="card adminbox"><div class="title">👑 Admin panel</div><div class="hint">Narxlar, AI modellar, worker, bot holati va foydalanuvchi balanslari shu yerdan boshqariladi.</div><div class="row" style="margin-top:10px"><button class="btn" onclick="adminLoad()">Yangilash</button><button class="btn red" onclick="adminToggle()">Bot holati</button></div></div><div class="card"><div class="title">📊 Statistika</div><div id="astats">-</div></div><div class="card"><div class="title">🤖 AI modellarni boshqarish</div><div id="amodels">-</div><hr style="border-color:#1d2a3d;border-width:1px 0 0;margin:12px 0"><input id="mid" type="hidden"><input id="mname" class="input" placeholder="Model nomi"><div class="row" style="margin-top:8px"><select id="mkind" class="select"><option value="image">🖼️ image</option><option value="video">🎬 video</option></select><input id="mprice" class="input" type="number" placeholder="Narx"></div><textarea id="mworkflow" class="textarea" style="margin-top:8px;min-height:90px" placeholder="ComfyUI API workflow JSON (video va maxsus modellar uchun)"></textarea><div class="row" style="margin-top:8px"><button class="btn primary" onclick="saveModel()">Modelni saqlash</button><button class="btn" onclick="clearModel()">Tozalash</button></div></div><div class="card"><div class="title">💰 Balansni boshqarish</div><input id="auser" class="input" inputmode="numeric" placeholder="Foydalanuvchi Telegram ID"><div class="row" style="margin-top:8px"><input id="adelta" class="input" inputmode="numeric" placeholder="Summa (+/-)"><button class="btn green" onclick="adminBalance()">Saqlash</button></div></div><div class="card"><div class="title">💳 Cheklar</div><button class="btn" onclick="adminPayments()">Cheklarni yangilash</button><div id="apays"></div></div><div class="card"><div class="title">⚙️ Narxlar, bonuslar va karta</div><button class="btn" onclick="adminConfig()">Sozlamalarni ko‘rish</button><div id="aconfig"></div></div><div class="card"><div class="title">⚙️ Worker</div><input id="workerName" class="input" placeholder="Worker nomi"><input id="workerKey" class="input" style="margin-top:8px" placeholder="Worker key (faqat bir marta ko‘rsatish uchun)"><button class="btn primary" style="margin-top:8px" onclick="saveWorker()">Saqlash</button></div></div>
 <div id="status" class="status"></div></div>
 <div class="nav"><button class="active" onclick="page('home',this)">🏠 Bosh</button><button onclick="page('balancePanel',this)">💳 Balans</button><button onclick="page('refPanel',this)">👥 Referal</button><button onclick="page('jobsPanel',this)">🧾 Ishlar</button><button id="adminNav" class="hide" onclick="page('adminPanel',this)">👑 Admin</button></div>
 <script>
-const tg=window.Telegram?.WebApp; tg?.ready(); tg?.expand(); const H=()=>({'X-Telegram-Init-Data':tg?.initData||'','Content-Type':'application/json'}); let selectedModel=null;
+const tg=window.Telegram?.WebApp; tg?.ready(); tg?.expand();
+const ids=['mid','mname','mkind','mprice','mworkflow','auser','adelta','apays','aconfig','ttsLang','ttsVoice','sttLang','sttFile','sttResult','rec','stop'];
+const els=Object.fromEntries(ids.map(id=>[id,document.getElementById(id)]));
+const {mid,mname,mkind,mprice,mworkflow,auser,adelta,apays,aconfig,ttsLang,ttsVoice,sttLang,sttFile,sttResult,rec,stop}=els;
+const H=()=>({'X-Telegram-Init-Data':tg?.initData||'','Content-Type':'application/json'}); let selectedModel=null;
 async function api(url,opt={}){opt.headers={...(opt.headers||{}),...(url.includes('/api/')?H():{})};const r=await fetch(url,opt);const d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.error||'Xatolik');return d}
 function page(id,b){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(x=>x.classList.remove('active'));b?.classList.add('active')}
 function mode(id,b){document.querySelectorAll('.tool').forEach(x=>x.classList.add('hide'));document.getElementById(id).classList.remove('hide');document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active')}
-async function load(){try{const d=await api('/api/me');document.getElementById('hello').textContent='Salom, '+(d.first_name||'foydalanuvchi')+' 👋';document.getElementById('bal').textContent=d.balance.toLocaleString()+' so‘m';document.getElementById('refs').textContent=d.refs+' referal';document.getElementById('lang').textContent=d.language||'-';document.getElementById('voice').textContent=d.voice||'-';document.getElementById('refLink').value=d.ref_link||'';if(d.is_admin)document.getElementById('adminNav').classList.remove('hide');document.getElementById('payInfo').textContent=d.pay_info||'-';document.getElementById('amounts').innerHTML=(d.amounts||[]).map(a=>`<button class="btn" onclick="document.getElementById('customAmount').value=${a}">${a.toLocaleString()} so‘m</button>`).join('');await loadModels();await loadJobs()}catch(e){status(e.message)}}
+async function load(){try{const d=await api('/api/me');document.getElementById('hello').textContent='Salom, '+(d.first_name||'foydalanuvchi')+' 👋';document.getElementById('bal').textContent=d.balance.toLocaleString()+' so‘m';document.getElementById('refs').textContent=d.refs+' referal';document.getElementById('lang').textContent=d.language||'-';document.getElementById('voice').textContent=d.voice||'-';document.getElementById('refLink').value=d.ref_link||'';if(d.is_admin){document.getElementById('adminNav').classList.remove('hide');await adminLoad()}document.getElementById('payInfo').textContent=d.pay_info||'-';document.getElementById('amounts').innerHTML=(d.amounts||[]).map(a=>`<button class="btn" onclick="document.getElementById('customAmount').value=${a}">${a.toLocaleString()} so‘m</button>`).join('');await loadModels();await loadJobs();await loadSettings()}catch(e){status(e.message)}}
 function status(x){document.getElementById('status').textContent=x||''}
 function clearText(){document.getElementById('text').value=''}
 async function tts(){const text=document.getElementById('text').value.trim();if(!text)return status('Matn yozing.');status('⏳ Ovoz tayyorlanmoqda...');try{const r=await fetch('/api/tts',{method:'POST',headers:H(),body:JSON.stringify({text})});if(!r.ok){const e=await r.json();throw Error(e.error)}const blob=await r.blob(),url=URL.createObjectURL(blob);const p=document.getElementById('player');p.src=url;p.classList.remove('hide');p.play().catch(()=>{});status('✅ Tayyor.');load()}catch(e){status('❌ '+e.message)}}
 let mediaRecorder,chunks=[];async function startRecord(){try{const s=await navigator.mediaDevices.getUserMedia({audio:true});chunks=[];mediaRecorder=new MediaRecorder(s);mediaRecorder.ondataavailable=e=>e.data.size&&chunks.push(e.data);mediaRecorder.onstop=async()=>{s.getTracks().forEach(t=>t.stop());const fd=new FormData();fd.append('audio',new Blob(chunks,{type:mediaRecorder.mimeType||'audio/webm'}),'voice.webm');status('⏳ Aniqlanmoqda...');try{const r=await fetch('/api/stt',{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:fd});const d=await r.json();if(!r.ok)throw Error(d.error);document.getElementById('sttResult').textContent='📝 '+d.text;status('✅ Tayyor.');load()}catch(e){status('❌ '+e.message)}};mediaRecorder.start();rec.disabled=true;stop.disabled=false;status('🔴 Yozilmoqda...')}catch(e){status('❌ Mikrofon ruxsati kerak.')}}
 function stopRecord(){if(mediaRecorder&&mediaRecorder.state!=='inactive')mediaRecorder.stop();rec.disabled=false;stop.disabled=true}
-async function loadModels(){const d=await api('/api/models');document.getElementById('modelList').innerHTML=d.models.length?d.models.map(m=>`<div class="model ${selectedModel===m.id?'sel':''}" onclick="selectModel(${m.id})"><strong>${m.kind==='video'?'🎬':'🖼️'} ${m.name}</strong><small>${m.description||''} · ${m.price.toLocaleString()} so‘m</small></div>`).join(''):'<div class="hint">Hozircha model yoqilmagan.</div>';if(!selectedModel&&d.models[0])selectModel(d.models[0].id)}
-async function selectModel(id){selectedModel=id;await loadModels()}
+let visibleModels=[];
+function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function renderModels(){const box=document.getElementById('modelList');box.innerHTML=visibleModels.length?visibleModels.map(m=>`<div class="model ${selectedModel===m.id?'sel':''}" onclick="selectModel(${m.id})"><strong>${m.kind==='video'?'🎬':'🖼️'} ${esc(m.name)}</strong><small>${esc(m.description||'')} · ${m.price.toLocaleString()} so‘m</small></div>`).join(''):'<div class="hint">Hozircha sozlangan, faol model mavjud emas.</div>'}
+async function loadSettings(){const d=await api('/api/languages');ttsLang.innerHTML=d.tts.map(v=>`<option value="${esc(v.code)}">${esc(v.name)}</option>`).join('');sttLang.innerHTML=d.stt.map(v=>`<option value="${esc(v.code)}">${esc(v.name)}</option>`).join('');ttsLang.value=d.current_tts;sttLang.value=d.current_stt;await loadVoices(d.current_voice)}
+async function loadVoices(chosen){const d=await api('/api/voices?code='+encodeURIComponent(ttsLang.value));ttsVoice.innerHTML=d.voices.map(v=>`<option value="${v.id}">${esc(v.name)}</option>`).join('');if(chosen)ttsVoice.value=chosen}
+async function saveVoice(){try{const d=await api('/api/settings',{method:'POST',body:JSON.stringify({lang:ttsLang.value,voice:Number(ttsVoice.value)})});status('✅ Ovoz saqlandi');document.getElementById('lang').textContent=d.language;document.getElementById('voice').textContent=d.voice}catch(e){status('❌ '+e.message)}}
+async function saveSTTLang(){try{await api('/api/settings',{method:'POST',body:JSON.stringify({stt_lang:sttLang.value})});status('✅ STT tili saqlandi')}catch(e){status('❌ '+e.message)}}
+async function sttUpload(){const f=sttFile.files[0];if(!f)return status('Audio faylni tanlang.');const fd=new FormData();fd.append('audio',f,f.name);status('⏳ Audio matnga aylantirilmoqda...');try{const r=await fetch('/api/stt',{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:fd});const d=await r.json();if(!r.ok)throw Error(d.error);sttResult.textContent=d.text;status('✅ Tayyor');load()}catch(e){status('❌ '+e.message)}}
+async function loadModels(){const d=await api('/api/models');visibleModels=d.models||[];if(!visibleModels.find(m=>m.id===selectedModel))selectedModel=visibleModels[0]?.id||null;renderModels();const note=document.getElementById('workerStatus');if(note)note.textContent=d.worker_online?'🟢 Generator ulangan':'🔴 Generator ulanmagan. Pullik buyurtma qabul qilinmaydi.'}
+function selectModel(id){selectedModel=id;renderModels()}
 async function generate(){if(!selectedModel)return status('Model tanlang.');const p=document.getElementById('prompt').value.trim();if(!p)return status('Prompt yozing.');document.getElementById('genStatus').textContent='⏳ Navbatga qo‘shilmoqda...';try{const d=await api('/api/generate',{method:'POST',body:JSON.stringify({model_id:selectedModel,prompt:p,negative:document.getElementById('negative').value,size:document.getElementById('size').value})});document.getElementById('genStatus').textContent='✅ #'+d.job_id+' navbatga qo‘shildi. Worker tayyorlagach botga yuboriladi.';loadJobs();load()}catch(e){document.getElementById('genStatus').textContent='❌ '+e.message}}
-async function loadJobs(){try{const d=await api('/api/jobs');document.getElementById('jobs').innerHTML=d.jobs.length?d.jobs.map(j=>`<div class="job"><div class="jobtop"><b>#${j.id} · ${j.model}</b><span class="${j.status==='done'?'ok':j.status==='failed'?'bad':'wait'}">${j.status}</span></div><div class="hint">${j.cost.toLocaleString()} so‘m · ${new Date(j.created*1000).toLocaleString()}</div>${j.error?`<div class="danger">${j.error}</div>`:''}</div>`).join(''):'Hozircha generatsiya yo‘q.'}catch(e){}}
-async function topup(){const a=Number(document.getElementById('customAmount').value);if(!a)return;document.getElementById('payStatus').textContent='⏳ So‘rov...';try{const d=await api('/api/topup',{method:'POST',body:JSON.stringify({amount:a})});document.getElementById('payStatus').textContent='✅ So‘rov #'+d.payment_id+' yuborildi. Chekni botga yuboring.'}catch(e){document.getElementById('payStatus').textContent='❌ '+e.message}}
+async function loadJobs(){try{const d=await api('/api/jobs');document.getElementById('jobs').innerHTML=d.jobs.length?d.jobs.map(j=>`<div class="job"><div class="jobtop"><b>#${j.id} · ${esc(j.model)}</b><span class="${j.status==='done'?'ok':j.status==='failed'?'bad':'wait'}">${j.status}</span></div><div class="hint">${j.cost.toLocaleString()} so‘m · ${new Date(j.created*1000).toLocaleString()}</div>${j.error?`<div class="danger">${esc(j.error)}</div>`:''}</div>`).join(''):'Hozircha generatsiya yo‘q.'}catch(e){}}
+let lastPayment=0;async function topup(){const a=Number(document.getElementById('customAmount').value);if(!a)return status('Summani kiriting.');document.getElementById('payStatus').textContent='⏳ So‘rov...';try{const d=await api('/api/topup',{method:'POST',body:JSON.stringify({amount:a})});lastPayment=d.payment_id;document.getElementById('payStatus').textContent='✅ So‘rov #'+d.payment_id+' yaratildi. Endi chekni yuklang.'}catch(e){document.getElementById('payStatus').textContent='❌ '+e.message}}
+async function sendReceipt(){const f=document.getElementById('receipt').files[0];if(!lastPayment)return status('Avval to‘lov so‘rovini yarating.');if(!f)return status('Chek faylini tanlang.');const fd=new FormData();fd.append('payment_id',lastPayment);fd.append('receipt',f);status('⏳ Chek yuborilmoqda...');try{const r=await fetch('/api/receipt',{method:'POST',headers:{'X-Telegram-Init-Data':tg?.initData||''},body:fd});const d=await r.json();if(!r.ok)throw Error(d.error);status('✅ Chek adminga yuborildi.')}catch(e){status('❌ '+e.message)}}
 function copyRef(){navigator.clipboard?.writeText(document.getElementById('refLink').value);status('Referal havola nusxalandi.')}
-async function adminLoad(){try{const d=await api('/api/admin/overview');document.getElementById('astats').innerHTML=`<div class="kv"><span>Users</span><b>${d.users}</b></div><div class="kv"><span>Balanslar jami</span><b>${d.balance.toLocaleString()} so‘m</b></div><div class="kv"><span>Queued</span><b>${d.queued}</b></div><div class="kv"><span>Worker</span><b>${d.worker}</b></div>`;document.getElementById('amodels').innerHTML=d.models.map(m=>`<div class="kv"><span>${m.kind==='video'?'🎬':'🖼️'} ${m.name}<br><small>${m.enabled?'ON':'OFF'} · ${m.price.toLocaleString()} so‘m</small></span><b><button class="btn" style="width:auto;padding:7px" onclick='editModel(${JSON.stringify(m)})'>✏️</button> <button class="btn" style="width:auto;padding:7px" onclick='toggleModel(${m.id})'>${m.enabled?'OFF':'ON'}</button></b></div>`).join('');document.getElementById('workerName').value=d.worker_name||'';status('Admin ma’lumotlari yangilandi.')}catch(e){status('❌ '+e.message)}}
+let adminModelCache={};async function adminLoad(){try{const d=await api('/api/admin/overview');adminModelCache=Object.fromEntries(d.models.map(m=>[m.id,m]));document.getElementById('astats').innerHTML=`<div class="kv"><span>Users</span><b>${d.users}</b></div><div class="kv"><span>Balanslar jami</span><b>${d.balance.toLocaleString()} so‘m</b></div><div class="kv"><span>Queued</span><b>${d.queued}</b></div><div class="kv"><span>Worker</span><b>${d.worker}</b></div>`;document.getElementById('amodels').innerHTML=d.models.map(m=>`<div class="kv"><span>${m.kind==='video'?'🎬':'🖼️'} ${esc(m.name)}<br><small>${m.enabled?'ON':'OFF'} · ${m.price.toLocaleString()} so‘m</small></span><b><button class="btn" style="width:auto;padding:7px" onclick='editModel(${JSON.stringify(m)})'>✏️</button> <button class="btn" style="width:auto;padding:7px" onclick='toggleModel(${m.id})'>${m.enabled?'OFF':'ON'}</button></b></div>`).join('');document.getElementById('workerName').value=d.worker_name||'';status('Admin ma’lumotlari yangilandi.')}catch(e){status('❌ '+e.message)}}
 async function adminToggle(){try{const d=await api('/api/admin/toggle',{method:'POST',body:'{}'});status(d.message)}catch(e){status('❌ '+e.message)}}
 async function saveWorker(){try{const d=await api('/api/admin/worker',{method:'POST',body:JSON.stringify({name:document.getElementById('workerName').value,key:document.getElementById('workerKey').value})});status(d.message)}catch(e){status('❌ '+e.message)}}
+async function adminBalance(){try{const d=await api('/api/admin/balance',{method:'POST',body:JSON.stringify({uid:Number(auser.value),delta:Number(adelta.value)})});status(d.message);adminLoad()}catch(e){status('❌ '+e.message)}}
+async function adminPayments(){try{const d=await api('/api/admin/payments');apays.innerHTML=d.payments.map(p=>`<div class="job">#${p.id} · ${p.uid} · ${p.amount.toLocaleString()} so‘m · ${esc(p.status)} ${p.receipt?'📎':''}${p.status==='wait'&&p.receipt?`<div class="row"><button class="btn green" onclick="reviewPayment(${p.id},'ok')">✅ Tasdiqlash</button><button class="btn red" onclick="reviewPayment(${p.id},'no')">❌ Rad</button></div>`:''}</div>`).join('')||'So‘rovlar yo‘q.'}catch(e){status('❌ '+e.message)}}
+async function reviewPayment(id,statusValue){if(!confirm('To‘lovni tasdiqlaysizmi?'))return;try{const d=await api('/api/admin/payment',{method:'POST',body:JSON.stringify({id,status:statusValue})});status(d.message);adminPayments();adminLoad()}catch(e){status('❌ '+e.message)}}
+async function adminConfig(){try{const d=await api('/api/admin/config');aconfig.innerHTML=Object.entries(d.settings).map(([k,v])=>`<div class="job"><label>${esc(k)}<input class="input" id="cfg_${k}" value="${esc(v)}"></label><button class="btn" style="margin-top:6px" onclick="saveConfig('${k}')">Saqlash</button></div>`).join('')}catch(e){status('❌ '+e.message)}}
+async function saveConfig(k){try{const d=await api('/api/admin/config',{method:'POST',body:JSON.stringify({key:k,value:document.getElementById('cfg_'+k).value})});status(d.message);load()}catch(e){status('❌ '+e.message)}}
 function clearModel(){mid.value='';mname.value='';mprice.value='';mworkflow.value='';mkind.value='image'}
-function editModel(m){mid.value=m.id;mname.value=m.name;mkind.value=m.kind;mprice.value=m.price;status('Model tanlandi. Workflowni tahrirlab saqlang.')}
+async function editModel(m){try{const d=await api('/api/admin/model/'+m.id);mid.value=m.id;mname.value=d.name;mkind.value=d.kind;mprice.value=d.price;mworkflow.value=d.workflow||'';status('Model sozlamalari yuklandi.')}catch(e){status('❌ '+e.message)}}
 async function toggleModel(id){try{const d=await api('/api/admin/model/'+id+'/toggle',{method:'POST',body:'{}'});status(d.message);adminLoad();loadModels()}catch(e){status('❌ '+e.message)}}
 async function saveModel(){try{const d=await api('/api/admin/model',{method:'POST',body:JSON.stringify({id:Number(mid.value)||0,name:mname.value,kind:mkind.value,price:Number(mprice.value)||0,enabled:true,workflow:mworkflow.value})});status(d.message);clearModel();adminLoad();loadModels()}catch(e){status('❌ '+e.message)}}
-load();setInterval(loadJobs,5000);
+if(!tg?.initData){status('Mini Appni Telegramdagi bot tugmasidan oching. Oddiy brauzerda hisob autentifikatsiyasi ishlamaydi.')}else{load();setInterval(loadJobs,8000)}
 </script></body></html>"""
 
 flask_app = Flask(__name__)
+flask_app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
 def _webapp_user(init_data):
@@ -1243,6 +1316,42 @@ def health():
 @flask_app.route("/app")
 def mini_app():
     return WEB_APP_HTML
+
+@flask_app.route('/api/languages')
+def api_languages():
+    try:
+        uid,_,u=_api_auth()
+        tt=db.execute("SELECT code,name FROM langs WHERE active=1 AND EXISTS(SELECT 1 FROM voices v WHERE v.code=langs.code) ORDER BY pos").fetchall()
+        st=db.execute("SELECT code,name FROM langs WHERE active=1 AND stt!='' ORDER BY pos").fetchall()
+        return jsonify({'tts':[{'code':c,'name':n} for c,n in tt], 'stt':[{'code':c,'name':n} for c,n in st],
+                        'current_tts':u['lang'], 'current_stt':u['stt'], 'current_voice':u['voice']})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/voices')
+def api_voices():
+    try:
+        _api_auth();code=str(request.args.get('code',''))
+        rows=db.execute('SELECT v.id,v.name FROM voices v JOIN langs l ON l.code=v.code WHERE v.code=? AND l.active=1',(code,)).fetchall()
+        return jsonify({'voices':[{'id':i,'name':n} for i,n in rows]})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/settings',methods=['POST'])
+def api_settings():
+    try:
+        uid,_,u=_api_auth();d=request.get_json(silent=True) or {}
+        if 'lang' in d or 'voice' in d:
+            lang=str(d.get('lang',''));voice=int(d.get('voice',0))
+            if not db.execute('SELECT 1 FROM voices v JOIN langs l ON v.code=l.code WHERE v.id=? AND v.code=? AND l.active=1',(voice,lang)).fetchone():
+                return jsonify({'error':'Ovoz/til mavjud emas.'}),400
+            db.execute('UPDATE users SET lang=?,voice=? WHERE id=?',(lang,voice,uid))
+        if 'stt_lang' in d:
+            st=str(d.get('stt_lang',''))
+            if not db.execute("SELECT 1 FROM langs WHERE code=? AND active=1 AND stt!=''",(st,)).fetchone():
+                return jsonify({'error':'STT tili mavjud emas.'}),400
+            db.execute('UPDATE users SET stt_lang=? WHERE id=?',(st,uid))
+        db.commit(); ch=tts_choice(uid)
+        return jsonify({'language':ch[1] if ch else '', 'voice':ch[2] if ch else ''})
+    except (ValueError,TypeError) as e:return jsonify({'error':str(e)}),400
 
 @flask_app.route("/api/me")
 def api_me():
@@ -1292,23 +1401,20 @@ def api_tts():
         out = os.path.join(tmp, "voice.mp3")
         try:
             asyncio.run(edge_tts.Communicate(text_value, ch[3]).save(out))
-            db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+            cur=db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
                        (cost, uid, cost))
-            if db.total_changes <= 0:
-                raise ValueError("Balans o‘zgarmadi.")
+            if cur.rowcount != 1:
+                raise ValueError("Balans yetarli emas.")
             db.commit()
-            return send_file(out, mimetype="audio/mpeg", as_attachment=False,
+            with open(out,'rb') as voice_file:
+                data=voice_file.read()
+            return send_file(io.BytesIO(data), mimetype="audio/mpeg", as_attachment=False,
                              download_name="voice.mp3")
         except Exception:
             db.rollback()
             raise
         finally:
-            # send_file faylni o‘qib bo‘lgach o‘chirish uchun delayed cleanup kerak;
-            # Render uchun kichik vaqtinchalik faylni alohida daemon thread tozalaydi.
-            def cleanup():
-                time.sleep(8)
-                shutil.rmtree(tmp, ignore_errors=True)
-            threading.Thread(target=cleanup, daemon=True).start()
+            shutil.rmtree(tmp, ignore_errors=True)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception:
@@ -1331,9 +1437,12 @@ def api_stt():
             return jsonify({"error": "Audio topilmadi."}), 400
 
         tmp = tempfile.mkdtemp(prefix="mini_stt_")
-        src_file = os.path.join(tmp, "input.webm")
+        original_name=os.path.basename(audio.filename or 'audio.webm')
+        src_file = os.path.join(tmp, 'input'+(os.path.splitext(original_name)[1].lower() or '.webm'))
         wav = os.path.join(tmp, "input.wav")
         audio.save(src_file)
+        if os.path.getsize(src_file)>15*1024*1024:
+            return jsonify({'error':'Audio 15 MB dan oshmasin.'}),413
 
         ff = imageio_ffmpeg.get_ffmpeg_exe()
         subprocess.run([ff, "-y", "-i", src_file, "-ar", "16000", "-ac", "1", wav],
@@ -1350,9 +1459,9 @@ def api_stt():
         if int(u["bal"]) < cost:
             return jsonify({"error": f"Balans yetarli emas. Kerak: {cost} so‘m."}), 402
 
-        db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
+        cur=db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",
                    (cost, uid, cost))
-        if db.total_changes <= 0:
+        if cur.rowcount != 1:
             db.rollback()
             return jsonify({"error": "Balans yetarli emas."}), 402
         db.commit()
@@ -1378,6 +1487,33 @@ def api_stt():
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+# Worker's heartbeat must be fresh before accepting any paid job.
+def worker_online():
+    try: return bool(S("worker_enabled") == "1" and int(S("worker_last_seen")) > time.time() - 45)
+    except (ValueError, KeyError): return False
+
+def create_ai_job(uid, mid, prompt, negative="", size="1024x1024"):
+    prompt=str(prompt).strip()
+    if not prompt or len(prompt)>Si("gen_max_prompt"):
+        return "Prompt bo‘sh yoki haddan tashqari uzun.",400
+    if not worker_online():
+        return "AI generator hozir ulanmagan. Mablag‘ yechilmadi.",503
+    row=db.execute("SELECT id,name,kind,price,enabled,workflow FROM ai_models WHERE id=?",(mid,)).fetchone()
+    if not row or not row[4]:return "Model faol emas.",404
+    if row[2]=='video' and not row[5]:return "Video model workflow hali ulanmagan; pul yechilmadi.",503
+    if row[2]=='image' and not row[5] and (S("worker_default_image")!='1' or row[1]!='SDXL / Stable Diffusion'):
+        return "Bu rasm modeli uchun alohida workflow hali ulanmagan; pul yechilmadi.",503
+    cost=max(0,int(row[3])); now=int(time.time())
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        cur=db.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?",(cost,uid,cost))
+        if cur.rowcount!=1:
+            db.rollback();return f"Balans yetarli emas. Kerak: {fmt(cost)} so‘m.",402
+        cur=db.execute("INSERT INTO ai_jobs(uid,model_id,prompt,negative,params,status,cost,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",(uid,mid,prompt,str(negative),json.dumps({'size':size}),"queued",cost,now,now))
+        jid=cur.lastrowid;db.commit();return jid,200
+    except Exception:
+        db.rollback(); logging.exception('create_ai_job');return "Buyurtma saqlanmadi. Pul yechilmadi.",500
+
 # ============ AI / ADMIN API ============
 def _admin_auth():
     uid, user, u = _api_auth()
@@ -1399,27 +1535,17 @@ def api_models():
     try:
         _api_auth()
         rows=db.execute("SELECT id,name,kind,price,description FROM ai_models WHERE enabled=1 ORDER BY kind,id").fetchall()
-        return jsonify({'models':[{'id':r[0],'name':r[1],'kind':r[2],'price':r[3],'description':r[4]} for r in rows]})
+        return jsonify({'models':[{'id':r[0],'name':r[1],'kind':r[2],'price':r[3],'description':r[4]} for r in rows], 'worker_online':worker_online()})
     except ValueError as e: return jsonify({'error':str(e)}),401
 
 @flask_app.route('/api/generate',methods=['POST'])
 def api_generate():
     try:
-        uid,_,u=_api_auth(); d=request.get_json(silent=True) or {}
-        mid=_json_int(d.get('model_id')); prompt=str(d.get('prompt','')).strip(); neg=str(d.get('negative','')).strip(); size=str(d.get('size','1024x1024'))
-        if not prompt:return jsonify({'error':'Prompt bo‘sh.'}),400
-        if len(prompt)>Si('gen_max_prompt'):return jsonify({'error':'Prompt juda uzun.'}),400
-        row=db.execute("SELECT id,name,kind,price,enabled FROM ai_models WHERE id=?",(mid,)).fetchone()
-        if not row or not row[4]:return jsonify({'error':'Model mavjud emas yoki o‘chirilgan.'}),404
-        cost=int(row[3]);
-        db.execute('BEGIN IMMEDIATE')
-        cur=db.execute('UPDATE users SET balance=balance-? WHERE id=? AND balance>=?',(cost,uid,cost))
-        if cur.rowcount!=1: db.rollback(); return jsonify({'error':f'Balans yetarli emas. Kerak: {cost:,} so‘m.'}),402
-        now=int(time.time()); cur=db.execute("INSERT INTO ai_jobs(uid,model_id,prompt,negative,params,status,cost,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",(uid,mid,prompt,neg,json.dumps({'size':size},ensure_ascii=False),'queued',cost,now,now)); jid=cur.lastrowid; db.commit()
-        return jsonify({'job_id':jid,'cost':cost,'status':'queued'})
+        uid,_,_=_api_auth();d=request.get_json(silent=True) or {}
+        result,code=create_ai_job(uid,_json_int(d.get('model_id')),d.get('prompt',''),d.get('negative',''),str(d.get('size','1024x1024')))
+        if code!=200:return jsonify({'error':result}),code
+        return jsonify({'job_id':result,'status':'queued'})
     except ValueError as e:return jsonify({'error':str(e)}),401
-    except Exception:
-        db.rollback();logging.exception('api_generate');return jsonify({'error':'Generatsiya navbatiga qo‘shishda xato.'}),500
 
 @flask_app.route('/api/jobs')
 def api_jobs():
@@ -1433,7 +1559,7 @@ def api_topup():
     try:
         uid,_,_= _api_auth(); d=request.get_json(silent=True) or {}; amount=_json_int(d.get('amount'))
         if amount<Si('min_topup'):return jsonify({'error':f'Minimum {fmt(Si("min_topup"))} so‘m.'}),400
-        cur=db.execute("INSERT INTO payments(uid,amount,status) VALUES(?,?,?)",(uid,amount,'wait'));db.commit();return jsonify({'payment_id':cur.lastrowid})
+        cur=db.execute("INSERT INTO payments(uid,amount,status,receipt_sent) VALUES(?,?,?,0)",(uid,amount,'wait'));db.commit();return jsonify({'payment_id':cur.lastrowid})
     except ValueError as e:return jsonify({'error':str(e)}),401
 
 @flask_app.route('/api/admin/overview')
@@ -1454,7 +1580,10 @@ def api_admin_worker():
     try:
         _admin_auth();d=request.get_json(silent=True) or {};name=str(d.get('name','local-gpu-1')).strip()[:80];key=str(d.get('key','')).strip()
         set_cfg('worker_name',name or 'local-gpu-1')
-        if key:set_cfg('worker_key',key)
+        if key:
+            if os.getenv('WORKER_KEY','').strip():return jsonify({'error':'WORKER_KEY server sozlamasida belgilangan. O‘sha qiymatdan foydalaning.'}),409
+            if len(key)<24:return jsonify({'error':'Worker kaliti kamida 24 belgidan iborat bo‘lsin.'}),400
+            set_cfg('worker_key',key)
         return jsonify({'message':'Worker sozlamalari saqlandi.'})
     except ValueError as e:return jsonify({'error':str(e)}),401
 
@@ -1462,7 +1591,12 @@ def api_admin_worker():
 def api_admin_model():
     try:
         _admin_auth();d=request.get_json(silent=True) or {};mid=_json_int(d.get('id'));name=str(d.get('name','')).strip();kind=str(d.get('kind','image')).lower();price=_json_int(d.get('price'),1000);enabled=1 if d.get('enabled') else 0;workflow=str(d.get('workflow',''))
-        if not name or kind not in ('image','video') or price<0:return jsonify({'error':'Model ma’lumotlari noto‘g‘ri.'}),400
+        if not name or len(name)>90 or kind not in ('image','video') or price<0:return jsonify({'error':'Model ma’lumotlari noto‘g‘ri.'}),400
+        if workflow:
+            try:
+                graph=json.loads(workflow)
+                if not isinstance(graph,dict) or not graph:raise ValueError()
+            except Exception:return jsonify({'error':'Workflow to‘g‘ri ComfyUI API JSON bo‘lishi shart.'}),400
         if mid:db.execute("UPDATE ai_models SET name=?,kind=?,price=?,enabled=?,workflow=? WHERE id=?",(name,kind,price,enabled,workflow,mid))
         else:db.execute("INSERT INTO ai_models(name,kind,price,enabled,description,workflow,created) VALUES(?,?,?,?,?,?,?)",(name,kind,price,enabled,str(d.get('description','')),workflow,int(time.time())))
         db.commit();return jsonify({'message':'Model saqlandi.'})
@@ -1474,8 +1608,110 @@ def api_admin_model_toggle(mid):
     try:
         _admin_auth();r=db.execute('SELECT enabled FROM ai_models WHERE id=?',(mid,)).fetchone()
         if not r:return jsonify({'error':'Model topilmadi.'}),404
-        db.execute('UPDATE ai_models SET enabled=? WHERE id=?',(0 if r[0] else 1,mid));db.commit();return jsonify({'message':'Model holati yangilandi.'})
+        db.execute('UPDATE ai_models SET enabled=? WHERE id=?',(0 if r[0] else 1,mid));db.commit();return jsonify({'message':'Model holati yangilandi. Workflow va Worker ham sozlangan bo‘lishi shart.'})
     except ValueError as e:return jsonify({'error':str(e)}),401
+
+
+@flask_app.route('/worker/heartbeat',methods=['POST'])
+def worker_heartbeat():
+    if not _worker_key_ok():return jsonify({'error':'worker auth'}),401
+    d=request.get_json(silent=True) or {}
+    set_cfg('worker_last_seen',str(int(time.time())))
+    set_cfg('worker_enabled','1')
+    set_cfg('worker_default_image','1' if bool(d.get('default_image')) else '0')
+    return jsonify({'ok':True})
+
+@flask_app.route('/api/admin/model/<int:mid>')
+def admin_get_model(mid):
+    try:
+        _admin_auth();r=db.execute('SELECT id,name,kind,price,enabled,description,workflow FROM ai_models WHERE id=?',(mid,)).fetchone()
+        if not r:return jsonify({'error':'Model yo‘q'}),404
+        return jsonify(dict(zip(('id','name','kind','price','enabled','description','workflow'),r)))
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/admin/config',methods=['GET','POST'])
+def admin_config():
+    try:
+        _admin_auth()
+        editable=('tts_price','stt_sec','start_bonus','ref_bonus','min_topup','max_tts','amounts','card_number','card_owner')
+        if request.method=='GET':return jsonify({'settings':{k:S(k) for k in editable}})
+        d=request.get_json(silent=True) or {};key=d.get('key');val=str(d.get('value','')).strip()
+        if key not in editable:return jsonify({'error':'Bu sozlamani o‘zgartirib bo‘lmaydi.'}),400
+        if key in ('tts_price','stt_sec') and not (0<=float(val)<=100000):return jsonify({'error':'Noto‘g‘ri narx'}),400
+        if key in ('start_bonus','ref_bonus','min_topup','max_tts') and not (0<=int(val)<=100000000):return jsonify({'error':'Noto‘g‘ri qiymat'}),400
+        if key=='amounts' and (not val or not all(x.strip().isdigit() for x in val.split(','))):return jsonify({'error':'Summalarni vergul bilan yozing.'}),400
+        if len(val)>200:return jsonify({'error':'Juda uzun qiymat'}),400
+        set_cfg(key,val);return jsonify({'message':'Sozlama saqlandi.'})
+    except ValueError as e:return jsonify({'error':str(e)}),400
+
+@flask_app.route('/api/admin/balance',methods=['POST'])
+def admin_balance():
+    try:
+        _admin_auth();d=request.get_json(silent=True) or {};uid=int(d['uid']);delta=int(d['delta'])
+        if not 0<uid or abs(delta)>1000000000:return jsonify({'error':'ID/summa xato'}),400
+        with db:
+            cur=db.execute('UPDATE users SET balance=balance+? WHERE id=? AND balance+?>=0',(delta,uid,delta))
+        if cur.rowcount!=1:return jsonify({'error':'Foydalanuvchi yo‘q yoki balans manfiy bo‘ladi.'}),400
+        return jsonify({'message':f'Balans o‘zgardi: {fmt(get_user(uid)["bal"])} so‘m'})
+    except (ValueError,KeyError) as e:return jsonify({'error':str(e)}),400
+
+@flask_app.route('/api/admin/payments')
+def admin_payments():
+    try:
+        _admin_auth();rows=db.execute('SELECT id,uid,amount,status,receipt_sent FROM payments ORDER BY id DESC LIMIT 50').fetchall()
+        return jsonify({'payments':[{'id':i,'uid':uid,'amount':a,'status':status,'receipt':bool(receipt)} for i,uid,a,status,receipt in rows]})
+    except ValueError as e:return jsonify({'error':str(e)}),401
+
+@flask_app.route('/api/admin/payment',methods=['POST'])
+def admin_payment():
+    try:
+        _admin_auth();d=request.get_json(silent=True) or {};pid=int(d['id']);status=str(d['status'])
+        if status not in ('ok','no'):return jsonify({'error':'Status xato'}),400
+        db.execute('BEGIN IMMEDIATE')
+        r=db.execute('SELECT uid,amount,status,receipt_sent FROM payments WHERE id=?',(pid,)).fetchone()
+        if not r or r[2]!='wait' or not r[3]:db.rollback();return jsonify({'error':'Chek yuborilmagan yoki oldin tekshirilgan.'}),400
+        db.execute('UPDATE payments SET status=? WHERE id=?',(status,pid))
+        if status=='ok':db.execute('UPDATE users SET balance=balance+? WHERE id=?',(r[1],r[0]))
+        db.commit()
+        try:asyncio.run(bot_notify(r[0], '✅ To‘lov tasdiqlandi.' if status=='ok' else '❌ To‘lov rad etildi.'))
+        except Exception:logging.exception('Payment notification')
+        return jsonify({'message':'Chek ko‘rib chiqildi.'})
+    except (ValueError,KeyError) as e:
+        db.rollback();return jsonify({'error':str(e)}),400
+
+async def bot_notify(uid,message):
+    from telegram import Bot
+    async with Bot(TOKEN) as bot:await bot.send_message(chat_id=uid,text=message)
+
+@flask_app.route('/api/receipt',methods=['POST'])
+def api_receipt():
+    try:
+        uid,_,_=_api_auth();pid=int(request.form.get('payment_id','0'));f=request.files.get('receipt')
+        if not f:return jsonify({'error':'Chek faylini tanlang.'}),400
+        r=db.execute("SELECT amount,status FROM payments WHERE id=? AND uid=?",(pid,uid)).fetchone()
+        if not r or r[1]!='wait':return jsonify({'error':'To‘lov so‘rovi topilmadi.'}),404
+        file_data=f.read(8*1024*1024+1)
+        if len(file_data)>8*1024*1024:return jsonify({'error':'Chek 8 MB dan oshmasin.'}),413
+        ext=os.path.splitext(f.filename or '')[1].lower()
+        if ext not in ('.png','.jpg','.jpeg','.webp','.pdf'):return jsonify({'error':'PNG, JPG, WEBP yoki PDF yuboring.'}),400
+        count=0
+        for aid in admin_ids():
+            try:
+                asyncio.run(bot_send_receipt(aid,io.BytesIO(file_data),f'💳 Mini App chek #{pid}\n👤 {uid}\n💰 {fmt(r[0])} so‘m',pid,ext))
+                count+=1
+            except Exception:logging.exception('Receipt send to admin')
+        if not count:return jsonify({'error':'Adminga yuborib bo‘lmadi. Qayta urinib ko‘ring.'}),503
+        db.execute('UPDATE payments SET receipt_sent=1 WHERE id=? AND uid=?',(pid,uid));db.commit()
+        return jsonify({'ok':True})
+    except ValueError as e:return jsonify({'error':str(e)}),400
+
+async def bot_send_receipt(aid,buf,caption,pid,ext):
+    from telegram import Bot
+    buf.name='receipt'+ext
+    kb=M([[B('✅ Tasdiqlash',callback_data=f'pok:{pid}'),B('❌ Rad',callback_data=f'pno:{pid}')]])
+    async with Bot(TOKEN) as bot:
+        if ext=='.pdf': await bot.send_document(aid,document=buf,caption=caption,reply_markup=kb)
+        else: await bot.send_photo(aid,photo=buf,caption=caption,reply_markup=kb)
 
 @flask_app.route('/worker/next')
 def worker_next():
@@ -1492,25 +1728,41 @@ def worker_next():
 @flask_app.route('/worker/result',methods=['POST'])
 def worker_result():
     if not _worker_key_ok():return jsonify({'error':'worker auth'}),401
-    jid=_json_int(request.form.get('job_id'));status=request.form.get('status','failed');err=str(request.form.get('error',''))[:1000];f=request.files.get('file')
-    row=db.execute('SELECT uid,cost,result_type FROM ai_jobs WHERE id=?',(jid,)).fetchone()
-    if not row:return jsonify({'error':'job not found'}),404
-    uid,cost,_=row
+    jid=_json_int(request.form.get('job_id')); status=request.form.get('status','failed')
+    err=str(request.form.get('error',''))[:500];f=request.files.get('file')
+    if status not in ('done','failed'):return jsonify({'error':'status xato'}),400
+    if status=='done' and not f:return jsonify({'error':'fayl yo‘q'}),400
+    path=''
+    if status=='done':
+        ext=os.path.splitext(f.filename or '')[1].lower()
+        if ext not in ('.png','.jpg','.jpeg','.webp','.mp4','.webm','.gif'):
+            return jsonify({'error':'Fayl turi xato'}),400
+        root='/tmp/ai_results';os.makedirs(root,exist_ok=True)
+        path=os.path.join(root,f'{jid}{ext}')
+        f.save(path)
     try:
-        if status=='done' and f:
-            ext=os.path.splitext(f.filename or '')[1].lower() or ('.mp4' if request.form.get('type')=='video' else '.png')
-            root='/tmp/ai_results';os.makedirs(root,exist_ok=True);path=os.path.join(root,f'{jid}{ext}');f.save(path)
-            db.execute("UPDATE ai_jobs SET status='done',result_path=?,result_type=?,error='',updated=? WHERE id=?",(path,request.form.get('type','image'),int(time.time()),jid));db.commit()
-            # Send the finished media through Telegram; Render only holds a short-lived copy.
+        db.execute('BEGIN IMMEDIATE')
+        row=db.execute("SELECT uid,cost,status FROM ai_jobs WHERE id=?",(jid,)).fetchone()
+        if not row:db.rollback();return jsonify({'error':'job yo‘q'}),404
+        uid,cost,old=row
+        if old!='running':db.rollback();return jsonify({'error':'Bu buyurtma allaqachon yakunlangan.'}),409
+        if status=='done':
+            kind='video' if os.path.splitext(path)[1].lower() in ('.mp4','.webm','.gif') else 'image'
+            db.execute("UPDATE ai_jobs SET status='done',result_path=?,result_type=?,error='',updated=? WHERE id=?",(path,kind,int(time.time()),jid))
+        else:
+            db.execute("UPDATE ai_jobs SET status='failed',error=?,updated=? WHERE id=?",(err or 'Worker xatosi',int(time.time()),jid))
+            db.execute('UPDATE users SET balance=balance+? WHERE id=?',(cost,uid))
+        db.commit()
+        if status=='done':
             try:
-                if request.form.get('type')=='video':
-                    with open(path,'rb') as fh: asyncio.run(bot_send_video(uid,fh,caption=f'🎬 # {jid} Tayyor'))
+                if kind=='video':
+                    with open(path,'rb') as fh:asyncio.run(bot_send_video(uid,fh,caption=f'🎬 #{jid} Tayyor'))
                 else:
-                    with open(path,'rb') as fh: asyncio.run(bot_send_photo(uid,fh,caption=f'🖼️ #{jid} Tayyor'))
-            except Exception as e: logging.exception('telegram delivery');
-            return jsonify({'ok':True})
-        db.execute("UPDATE ai_jobs SET status='failed',error=?,updated=? WHERE id=?",(err or 'Worker xatosi',int(time.time()),jid));db.commit();add_bal(uid,cost);return jsonify({'ok':True,'refunded':cost})
-    except Exception:logging.exception('worker_result');return jsonify({'error':'result error'}),500
+                    with open(path,'rb') as fh:asyncio.run(bot_send_photo(uid,fh,caption=f'🎨 #{jid} Tayyor'))
+            except Exception:logging.exception('media delivery: job #%s',jid)
+        return jsonify({'ok':True,'refunded':cost if status=='failed' else 0})
+    except Exception:
+        db.rollback(); logging.exception('worker result');return jsonify({'error':'Natija qayd etilmadi.'}),500
 
 async def bot_send_photo(uid,fh,caption=''):
     # Temporary standalone bot client for worker callback; token never leaves server-side code.
@@ -1559,6 +1811,14 @@ def main():
         logging.info("Mini App URL: %s", WEB_APP_URL)
     else:
         logging.warning("APP_URL/RENDER_EXTERNAL_URL yo‘q. Mini App tugmasi ko‘rinmaydi.")
+    global BOT_USERNAME
+    if not BOT_USERNAME:
+        try:
+            from telegram import Bot
+            async def _username():
+                async with Bot(TOKEN) as b:return (await b.get_me()).username or ''
+            BOT_USERNAME=asyncio.run(_username())
+        except Exception as exc:logging.warning('BOT_USERNAME olinmadi: %s',exc)
     keep_alive()
     while True:
         asyncio.set_event_loop(asyncio.new_event_loop())

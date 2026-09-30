@@ -17,3 +17,5 @@ services:
         sync: false
       - key: WEBAPP_MAX_AGE
         value: "86400"
+      - key: WORKER_KEY
+        sync: false

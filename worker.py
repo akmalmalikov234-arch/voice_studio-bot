@@ -71,10 +71,12 @@ def wait_history(pid):
         if r.ok:
             d=r.json()
             item=d.get(pid)
-            if item and item.get('status',{}).get('completed'):
-                if item.get('status',{}).get('status_str')=='error':
-                    raise RuntimeError(str(item.get('status',{}).get('messages','ComfyUI error')))
-                return item.get('outputs',{})
+            if item:
+                state=item.get('status',{})
+                if state.get('status_str')=='error':
+                    raise RuntimeError(str(state.get('messages','ComfyUI error')))
+                if state.get('completed'):
+                    return item.get('outputs',{})
         time.sleep(2)
     raise TimeoutError('ComfyUI job timeout')
 
@@ -123,6 +125,16 @@ def main():
     logging.info('Worker %s -> %s | ComfyUI %s',WORKER_NAME,BACKEND,COMFY_URL)
     while True:
         try:
+            try:
+                chk=requests.get(COMFY_URL+'/system_stats',timeout=8)
+                comfy_ready=chk.ok
+            except requests.RequestException: comfy_ready=False
+            if not comfy_ready:
+                logging.warning('ComfyUI ulanmagan: %s',COMFY_URL)
+                time.sleep(8)
+                continue
+            hb=requests.post(BACKEND+'/worker/heartbeat',headers=headers(),json={'default_image':bool(CHECKPOINT)},timeout=20)
+            hb.raise_for_status()
             r=requests.get(BACKEND+'/worker/next',headers=headers(),timeout=30);r.raise_for_status();d=r.json();job=d.get('job')
             if not job:time.sleep(POLL);continue
             logging.info('Processing #%s %s',job['id'],job['name'])
